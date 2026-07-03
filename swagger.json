@@ -1,0 +1,420 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "TeleGap API",
+    "version": "1.0.0",
+    "description": "API documentation for TeleGap"
+  },
+  "servers": [
+    {
+      "url": "{API_URL}",
+      "variables": {
+        "API_URL": {
+          "default": "http://localhost:3001/api",
+          "description": "API base URL"
+        }
+      }
+    }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "summary": "API root placeholder",
+        "responses": {
+          "200": {
+            "description": "API is working",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/accounts": {
+      "get": {
+        "summary": "Get all Telegram accounts",
+        "description": "Retrieves a list of all registered Telegram accounts with their details",
+        "responses": {
+          "200": {
+            "description": "List of accounts retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "phone": { "type": "string" },
+                          "username": { "type": "string", "nullable": true },
+                          "groups_count": { "type": "integer" },
+                          "last_active": { "type": "string", "format": "date-time" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to fetch accounts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/accounts/{phone}": {
+      "delete": {
+        "summary": "Delete a Telegram account",
+        "description": "Removes a Telegram account from the system by phone number",
+        "parameters": [
+          {
+            "name": "phone",
+            "in": "path",
+            "required": true,
+            "description": "Phone number of the account to delete",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Account deleted successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "message": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing phone parameter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to delete account",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/login/send-code": {
+      "post": {
+        "summary": "Send Telegram login code to phone",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "phone": { "type": "string" }
+                },
+                "required": ["phone"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Code sent successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "message": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Missing or invalid phone" },
+          "500": { "description": "Failed to send code" }
+        }
+      }
+    },
+    "/login/verify": {
+      "post": {
+        "summary": "Verify Telegram login code and sign in",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "phone": { "type": "string" },
+                  "code": { "type": "string" },
+                  "password": { "type": "string" }
+                },
+                "required": ["phone", "code"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Login successful",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "user": { "type": "object" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Missing or invalid phone/code" },
+          "500": { "description": "Failed to verify code" }
+        }
+      }
+    },
+    "/groups/create": {
+      "post": {
+        "summary": "Create one or more Telegram supergroups with visible chat history.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "phone": { "type": "string", "description": "Telegram account phone number (must be logged in)" },
+                  "groupCount": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Number of groups to create (1-500)" },
+                  "namingPattern": { "type": "string", "description": "Pattern for group names, must include {n} for numbering" },
+                  "description": { "type": "string", "description": "Group/channel description (optional)" },
+                  "messages": { "type": "array", "items": { "type": "string" }, "description": "Optional: Array of messages to send after each group is created. Each message will be sent with 1 second delay after 2 seconds of group creation. If omitted, no messages will be sent." }
+                },
+                "required": ["phone", "groupCount", "namingPattern"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Groups created successfully (or with errors)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "success": { "type": "boolean" },
+                          "title": { "type": "string" },
+                          "id": { "type": "integer", "nullable": true },
+                          "error": { "type": "string", "nullable": true }
+                        }
+                      }
+                    },
+                    "groupsCreated": { "type": "integer", "description": "Number of groups successfully created" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Invalid input" },
+          "500": { "description": "Failed to create groups" }
+        }
+      }
+    },
+    "/queue/add": {
+      "post": {
+        "summary": "Add a job to the group creation queue",
+        "description": "Adds a new job to the queue for background processing of group creation",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "phone": { "type": "string", "description": "Telegram account phone number (must be logged in)" },
+                  "group_count": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Number of groups to create (1-500)" },
+                  "naming_pattern": { "type": "string", "description": "Pattern for group names, must include {n} for numbering" },
+                  "description": { "type": "string", "description": "Group/channel description (optional)" },
+                  "messages": { "type": "array", "items": { "type": "string" }, "description": "Optional: Array of messages to send after each group is created" }
+                },
+                "required": ["phone", "group_count", "naming_pattern"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Job added to queue successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "message": { "type": "string" },
+                    "job_id": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Missing required fields" },
+          "404": { "description": "Account not found" },
+          "500": { "description": "Failed to add job to queue" }
+        }
+      }
+    },
+    "/queue": {
+      "get": {
+        "summary": "Get all jobs in the queue",
+        "description": "Retrieves a list of all jobs in the group creation queue with their status",
+        "responses": {
+          "200": {
+            "description": "List of jobs retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "jobs": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": { "type": "integer" },
+                          "phone": { "type": "string" },
+                          "group_count": { "type": "integer" },
+                          "naming_pattern": { "type": "string" },
+                          "description": { "type": "string" },
+                          "messages": { "type": "array", "items": { "type": "string" } },
+                          "status": { "type": "string", "enum": ["pending", "processing", "completed", "failed"] },
+                          "created_at": { "type": "string", "format": "date-time" },
+                          "started_at": { "type": "string", "format": "date-time", "nullable": true },
+                          "completed_at": { "type": "string", "format": "date-time", "nullable": true },
+                          "error_message": { "type": "string", "nullable": true }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to get queue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "error": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/queue/{id}": {
+      "delete": {
+        "summary": "Delete a job from the queue",
+        "description": "Removes a job from the group creation queue by ID",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "ID of the job to delete",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job deleted successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "message": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to delete job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "error": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
