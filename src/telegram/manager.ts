@@ -546,14 +546,15 @@ export async function handleTelegramRateLimit(
     const match = error.message.match(pattern);
     if (match) {
       const waitSeconds = parseInt(match[1]);
-      const nextAvailableTime = new Date(Date.now() + waitSeconds * 1000);
+      const floodWaitUntil = new Date(Date.now() + waitSeconds * 1000);
 
-      // For all flood waits, mark account as unavailable with the exact wait time
-      // Don't change groups_created_24h - only set next_available_time
+      // Real Telegram flood wait: block via flood_wait_until, separate from the
+      // 24h window marker so it can trigger before the 50/24h cap is reached.
+      // Don't touch groups_created_24h or next_available_time.
       const { error: updateError } = await supabase
         .from("telegram_accounts")
         .update({
-          next_available_time: nextAvailableTime.toISOString(),
+          flood_wait_until: floodWaitUntil.toISOString(),
         })
         .eq("phone", phone);
 
@@ -579,12 +580,12 @@ export async function handleTelegramRateLimit(
   ) {
     // For other rate limits, set a default 1-hour wait
     const waitSeconds = 3600; // 1 hour default
-    const nextAvailableTime = new Date(Date.now() + waitSeconds * 1000);
+    const floodWaitUntil = new Date(Date.now() + waitSeconds * 1000);
 
     const { error: updateError } = await supabase
       .from("telegram_accounts")
       .update({
-        next_available_time: nextAvailableTime.toISOString(),
+        flood_wait_until: floodWaitUntil.toISOString(),
       })
       .eq("phone", phone);
 

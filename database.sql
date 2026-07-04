@@ -5,6 +5,7 @@ create table if not exists telegram_accounts (
   groups_count integer not null default 0,
   groups_created_24h integer not null default 0,
   next_available_time timestamptz,
+  flood_wait_until timestamptz,
   session_string text
 );
 
@@ -32,7 +33,10 @@ $$;
 DROP FUNCTION IF EXISTS update_rate_limit_status(text, integer);
 DROP FUNCTION IF EXISTS check_rate_limit(text);
 
--- Function to update rate limit status
+-- Function to update rate limit status.
+-- next_available_time marks when the rolling 24h window RESETS (not a block).
+-- Start the window on the first creation and leave it running for subsequent
+-- batches — only check_rate_limit clears it once the window has elapsed.
 create or replace function update_rate_limit_status(
   account_phone text,
   groups_created integer default 1
@@ -40,79 +44,87 @@ create or replace function update_rate_limit_status(
 begin
   update telegram_accounts
   set
-    next_available_time = now() + interval '24 hours'
+    next_available_time = coalesce(next_available_time, now() + interval '24 hours')
   where phone = account_phone;
 end;
 $$ language plpgsql;
 
--- Function to check and update rate limit
+-- Function to check and update rate limit.
+-- Two independent block sources:
+--   1. flood_wait_until  — a real Telegram flood wait; blocks until it passes
+--                          (can trigger before the 50/24h cap is reached).
+--   2. groups_created_24h >= 50 — the app's 50-per-rolling-24h cap.
+-- next_available_time is only the window-reset marker and never blocks on its own.
 create or replace function check_rate_limit(
   account_phone text
 ) returns json as $$
 declare
   account telegram_accounts;
   current_ts timestamptz;
+  wait_seconds integer;
   result json;
 begin
   select * into account from telegram_accounts where phone = account_phone;
-  
+
   if account is null then
     return json_build_object('error', 'Account not found');
   end if;
-  
+
   current_ts := now();
 
-  -- Reset rate limit if 24h has passed since last group creation
+  -- 1. Active Telegram flood wait — hard block until it expires.
+  if account.flood_wait_until is not null and current_ts < account.flood_wait_until then
+    wait_seconds := extract(epoch from (account.flood_wait_until - current_ts))::integer;
+    return json_build_object(
+      'can_create', false,
+      'wait_seconds', wait_seconds,
+      'groups_created_24h', account.groups_created_24h,
+      'total_groups', account.groups_count,
+      'error', 'Account is in a Telegram flood wait.'
+    );
+  end if;
+
+  -- Flood wait has passed — clear the stale marker.
+  if account.flood_wait_until is not null and current_ts >= account.flood_wait_until then
+    update telegram_accounts
+    set flood_wait_until = null
+    where phone = account_phone;
+    account.flood_wait_until := null;
+  end if;
+
+  -- 2. Rolling 24h window elapsed — reset the daily counter.
   if account.next_available_time is not null and current_ts >= account.next_available_time then
     update telegram_accounts
     set
       groups_created_24h = 0,
       next_available_time = null
     where phone = account_phone;
-    
-    result := json_build_object(
-      'can_create', true,
-      'wait_seconds', 0,
-      'groups_created_24h', 0,
-      'total_groups', account.groups_count
-    );
-  else
-    -- Check if account is currently unavailable (flood wait or rate limit)
-    if account.next_available_time is not null and current_ts < account.next_available_time then
-      -- Calculate wait seconds
-      declare
-        wait_seconds integer;
-      begin
-        wait_seconds := extract(epoch from (account.next_available_time - current_ts))::integer;
-        
-        result := json_build_object(
-          'can_create', false,
-          'wait_seconds', wait_seconds,
-          'groups_created_24h', account.groups_created_24h,
-          'total_groups', account.groups_count,
-          'error', 'Account is currently unavailable due to flood wait or rate limit.'
-        );
-      end;
-    -- Check if account has hit rate limit (50 groups)
-    elsif account.groups_created_24h >= 50 then
-      result := json_build_object(
-        'can_create', false,
-        'wait_seconds', 0,
-        'groups_created_24h', account.groups_created_24h,
-        'total_groups', account.groups_count,
-        'error', 'Rate limit exceeded. Maximum 50 groups per 24 hours.'
-      );
-    else
-      result := json_build_object(
-        'can_create', true,
-        'wait_seconds', 0,
-        'groups_created_24h', account.groups_created_24h,
-        'total_groups', account.groups_count
-      );
-    end if;
+    account.groups_created_24h := 0;
+    account.next_available_time := null;
   end if;
-  
-  return result;
+
+  -- 3. Hit the 50-per-24h cap — blocked until the window resets.
+  if account.groups_created_24h >= 50 then
+    wait_seconds := coalesce(
+      extract(epoch from (account.next_available_time - current_ts))::integer,
+      0
+    );
+    return json_build_object(
+      'can_create', false,
+      'wait_seconds', wait_seconds,
+      'groups_created_24h', account.groups_created_24h,
+      'total_groups', account.groups_count,
+      'error', 'Rate limit exceeded. Maximum 50 groups per 24 hours.'
+    );
+  end if;
+
+  -- Otherwise the account is free to create.
+  return json_build_object(
+    'can_create', true,
+    'wait_seconds', 0,
+    'groups_created_24h', account.groups_created_24h,
+    'total_groups', account.groups_count
+  );
 end;
 $$ language plpgsql;
 
@@ -128,11 +140,21 @@ begin
   end if;
 
   if not exists (
-    select 1 from information_schema.columns 
-    where table_name = 'telegram_accounts' 
+    select 1 from information_schema.columns
+    where table_name = 'telegram_accounts'
     and column_name = 'next_available_time'
   ) then
     alter table telegram_accounts add column next_available_time timestamptz;
+  end if;
+
+  -- Real Telegram flood-wait deadline, kept separate from the 24h window marker
+  -- so a flood wait can block the account before the 50/24h cap is reached.
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'telegram_accounts'
+    and column_name = 'flood_wait_until'
+  ) then
+    alter table telegram_accounts add column flood_wait_until timestamptz;
   end if;
 end $$;
 

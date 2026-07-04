@@ -28,10 +28,13 @@ router.post(
   async (_req: Request, res: Response) => {
     try {
       const now = new Date().toISOString();
+      // Clear both block sources: expire the 24h window (next_available_time in
+      // the past forces a counter reset) and drop any active flood wait. Match
+      // rows blocked by either column.
       const { data, error } = await supabase
         .from("telegram_accounts")
-        .update({ next_available_time: now })
-        .not("next_available_time", "is", null);
+        .update({ next_available_time: now, flood_wait_until: null })
+        .or("next_available_time.not.is.null,flood_wait_until.not.is.null");
 
       if (error) throw error;
       res.json({ success: true, message: "Updated all accounts availability" });
@@ -701,7 +704,7 @@ router.get("/accounts", async (_req: Request, res: Response) => {
     const { data, error } = await supabase
       .from("telegram_accounts")
       .select(
-        "phone, username, groups_count, groups_created_24h, next_available_time"
+        "phone, username, groups_count, groups_created_24h, next_available_time, flood_wait_until"
       )
       .order("phone", { ascending: true });
 
@@ -718,6 +721,10 @@ router.get("/accounts", async (_req: Request, res: Response) => {
               await supabase.rpc("check_rate_limit", {
                 account_phone: account.phone,
               });
+            // Surface whichever block is actually active so the client
+            // countdown reflects a real flood wait, not just the window marker.
+            const effectiveAvailableTime =
+              account.flood_wait_until ?? account.next_available_time;
             if (rateLimitError) {
               console.error("Rate limit check error:", rateLimitError);
               return {
@@ -725,7 +732,7 @@ router.get("/accounts", async (_req: Request, res: Response) => {
                 username: account.username,
                 groups_count: account.groups_count || 0,
                 groups_created_24h: account.groups_created_24h || 0,
-                next_available_time: account.next_available_time,
+                next_available_time: effectiveAvailableTime,
                 rateLimitInfo: null,
               };
             }
@@ -737,7 +744,7 @@ router.get("/accounts", async (_req: Request, res: Response) => {
                 (rateLimitInfo.groups_created_24h ??
                   account.groups_created_24h) ||
                 0,
-              next_available_time: account.next_available_time,
+              next_available_time: effectiveAvailableTime,
               can_create: rateLimitInfo.can_create,
               wait_seconds: rateLimitInfo.wait_seconds,
               total_groups: rateLimitInfo.total_groups,
@@ -907,12 +914,15 @@ router.post(
     }
 
     try {
-      const nextAvailableTime = new Date(Date.now() + wait_seconds * 1000);
+      // Manually park an account for wait_seconds. Use flood_wait_until so it
+      // actually blocks under the new logic (next_available_time is only the
+      // 24h window marker and no longer blocks on its own).
+      const floodWaitUntil = new Date(Date.now() + wait_seconds * 1000);
 
       const { error: updateError } = await supabase
         .from("telegram_accounts")
         .update({
-          next_available_time: nextAvailableTime.toISOString(),
+          flood_wait_until: floodWaitUntil.toISOString(),
         })
         .eq("phone", phone);
 
@@ -930,7 +940,7 @@ router.post(
         data: {
           phone,
           wait_seconds,
-          nextAvailableTime,
+          floodWaitUntil,
         },
       });
     } catch (err) {
