@@ -56,6 +56,14 @@ router.post("/queue/add", async (req: Request, res: Response) => {
       });
     }
 
+    const count = Number(group_count);
+    if (!count || count < 1 || count > 50) {
+      return res.status(400).json({
+        success: false,
+        error: "group_count must be between 1 and 50",
+      });
+    }
+
     // Validate phone exists
     const { data: account, error: accountError } = await supabase
       .from("telegram_accounts")
@@ -70,21 +78,49 @@ router.post("/queue/add", async (req: Request, res: Response) => {
       });
     }
 
-    // Add job to queue
-    const { data: job, error: jobError } = await supabase
+    // Base row shared by both group and channel jobs.
+    const baseRow = {
+      phone,
+      group_count: count,
+      naming_pattern,
+      description: description || "",
+      messages: messages || [],
+      status: "pending",
+      created_at: new Date().toISOString(),
+    };
+
+    // Add job to queue (with the newer `type` column).
+    let { data: job, error: jobError } = await supabase
       .from("group_creation_queue")
-      .insert({
-        phone,
-        group_count,
-        naming_pattern,
-        description: description || "",
-        messages: messages || [],
-        type: jobType,
-        status: "pending",
-        created_at: new Date().toISOString(),
-      })
+      .insert({ ...baseRow, type: jobType })
       .select()
       .single();
+
+    // If the `type` column doesn't exist yet (DB not migrated), Supabase returns
+    // a schema-cache error. Groups don't need the column, so retry without it and
+    // keep working; channels genuinely require the migration, so surface a clear
+    // one-line fix instead of a cryptic error.
+    const columnMissing =
+      jobError &&
+      /type/i.test(jobError.message) &&
+      /(column|schema cache|does not exist)/i.test(jobError.message);
+
+    if (columnMissing) {
+      if (jobType === "channel") {
+        return res.status(500).json({
+          success: false,
+          error:
+            "The database is missing the 'type' column required for channels. " +
+            "Run this once in Supabase SQL editor: " +
+            "ALTER TABLE group_creation_queue ADD COLUMN type text NOT NULL DEFAULT 'group';",
+        });
+      }
+      ({ data: job, error: jobError } = await supabase
+        .from("group_creation_queue")
+        .insert(baseRow)
+        .select()
+        .single());
+    }
 
     if (jobError) {
       return res.status(500).json({
