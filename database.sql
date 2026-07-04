@@ -234,10 +234,3 @@ ON group_creation_queue
 FOR ALL
 USING (true)
 WITH CHECK (true);
-
--- Create RLS policy for telegram_accounts
-CREATE POLICY "Allow full access to telegram_accounts" 
-ON telegram_accounts
-FOR ALL
-USING (true)
-WITH CHECK (true);

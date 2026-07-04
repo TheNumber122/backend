@@ -9,7 +9,7 @@ import {
   verifyLoginCode,
   withAccountLock,
 } from "./telegram/manager";
-import { supabase } from "./db/supabase";
+import { supabase, protectedDb } from "./db/supabase";
 import { broadcastLog } from "./broadcast";
 
 // Queue processor
@@ -432,6 +432,12 @@ async function createGroupsInner(
             timestamp: new Date().toISOString(),
           });
 
+          // Protect broadcast channels from the external auto-leave bot.
+          // (Megagroups are already skipped by the bot's megagroup !== true filter.)
+          if (type === "channel") {
+            await recordProtectedChannel(phone, chat.id, title);
+          }
+
           const msgError = await sendMessagesToGroup(
             client,
             chat.id,
@@ -635,6 +641,40 @@ async function createSingleGroup(
     if (chatsArr.length > 0) return chatsArr[chatsArr.length - 1];
   }
   return null;
+}
+
+// Record a channel we created into the external auto-leave bot's Supabase so it
+// never leaves it. `channelId` is the BARE Telegram channel id (matches GramJS
+// entity.id on the bot side). Best-effort: failures are logged, never thrown.
+async function recordProtectedChannel(
+  phone: string,
+  channelId: any,
+  title: string
+): Promise<void> {
+  if (!protectedDb) return; // Not configured — skip silently.
+  try {
+    const { error } = await protectedDb
+      .from("protected_channels")
+      .upsert(
+        { channel_id: String(channelId), phone, title },
+        { onConflict: "channel_id" }
+      );
+    if (error) {
+      broadcastLog({
+        message: `Could not record protected channel ${title}: ${error.message}`,
+        type: "error",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  } catch (err: any) {
+    broadcastLog({
+      message: `Could not record protected channel ${title}: ${
+        err?.message || "Unknown error"
+      }`,
+      type: "error",
+      timestamp: new Date().toISOString(),
+    });
+  }
 }
 
 // Helper: send messages to a newly created group, returns error string or null
