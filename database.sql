@@ -3,6 +3,7 @@ create table if not exists telegram_accounts (
   phone text primary key,
   username text,
   groups_count integer not null default 0,
+  channels_count integer not null default 0,
   groups_created_24h integer not null default 0,
   next_available_time timestamptz,
   flood_wait_until timestamptz,
@@ -16,15 +17,31 @@ alter table telegram_accounts enable row level security;
 grant all privileges on table telegram_accounts to service_role;
 grant all privileges on all sequences in schema public to service_role;
 
--- Function to increment groups count for an account
+-- Function to increment groups count for an account.
+-- groups_count is the COMBINED total (groups + channels) and drives the 500-full
+-- limit and the 50/24h rate limit; channels_count (below) is the channels-only
+-- subset used purely for display breakdown.
 create or replace function increment_groups_count(phone_number text, increment_amount integer)
 returns void
 language plpgsql
 as $$
 begin
-  update telegram_accounts 
+  update telegram_accounts
   set groups_count = groups_count + increment_amount,
       groups_created_24h = groups_created_24h + increment_amount
+  where phone = phone_number;
+end;
+$$;
+
+-- Function to increment the channels-only counter (a subset of groups_count).
+-- Called in addition to increment_groups_count when the created entity is a channel.
+create or replace function increment_channels_count(phone_number text, increment_amount integer)
+returns void
+language plpgsql
+as $$
+begin
+  update telegram_accounts
+  set channels_count = channels_count + increment_amount
   where phone = phone_number;
 end;
 $$;
@@ -131,9 +148,20 @@ $$ language plpgsql;
 -- Add columns if they don't exist (safe to run multiple times)
 do $$
 begin
+  -- Channels-only counter (subset of groups_count). Existing rows default to 0,
+  -- so channels created before this column existed still count toward groups_count
+  -- and will display as groups; the breakdown is accurate for creations going forward.
   if not exists (
-    select 1 from information_schema.columns 
-    where table_name = 'telegram_accounts' 
+    select 1 from information_schema.columns
+    where table_name = 'telegram_accounts'
+    and column_name = 'channels_count'
+  ) then
+    alter table telegram_accounts add column channels_count integer not null default 0;
+  end if;
+
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'telegram_accounts'
     and column_name = 'groups_created_24h'
   ) then
     alter table telegram_accounts add column groups_created_24h integer not null default 0;

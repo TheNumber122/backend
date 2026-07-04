@@ -588,6 +588,15 @@ async function createGroupsInner(
         increment_amount: successfulGroups,
       });
 
+      // Track channels separately (subset of groups_count) so the UI can show a
+      // groups/channels breakdown. groups_count stays the combined total.
+      if (type === "channel") {
+        await supabase.rpc("increment_channels_count", {
+          phone_number: phone,
+          increment_amount: successfulGroups,
+        });
+      }
+
       await supabase.rpc("update_rate_limit_status", {
         account_phone: phone,
         groups_created: successfulGroups,
@@ -753,7 +762,7 @@ router.get("/accounts", async (_req: Request, res: Response) => {
     const { data, error } = await supabase
       .from("telegram_accounts")
       .select(
-        "phone, username, groups_count, groups_created_24h, next_available_time, flood_wait_until"
+        "phone, username, groups_count, channels_count, groups_created_24h, next_available_time, flood_wait_until"
       )
       .order("phone", { ascending: true });
 
@@ -780,6 +789,7 @@ router.get("/accounts", async (_req: Request, res: Response) => {
                 phone: account.phone,
                 username: account.username,
                 groups_count: account.groups_count || 0,
+                channels_count: account.channels_count || 0,
                 groups_created_24h: account.groups_created_24h || 0,
                 next_available_time: effectiveAvailableTime,
                 rateLimitInfo: null,
@@ -789,6 +799,7 @@ router.get("/accounts", async (_req: Request, res: Response) => {
               phone: account.phone,
               username: account.username,
               groups_count: account.groups_count || 0,
+              channels_count: account.channels_count || 0,
               groups_created_24h:
                 (rateLimitInfo.groups_created_24h ??
                   account.groups_created_24h) ||
