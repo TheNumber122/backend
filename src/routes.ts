@@ -653,12 +653,21 @@ async function recordProtectedChannel(
 ): Promise<void> {
   if (!protectedDb) return; // Not configured — skip silently.
   try {
-    const { error } = await protectedDb
+    // Never let a slow/hanging external DB stall channel creation or the queue:
+    // supabase-js has no built-in timeout, so cap the write ourselves.
+    const upsert = protectedDb
       .from("protected_channels")
       .upsert(
         { channel_id: String(channelId), phone, title },
         { onConflict: "channel_id" }
       );
+    const timeout = new Promise<{ error: { message: string } }>((resolve) =>
+      setTimeout(
+        () => resolve({ error: { message: "timed out after 10s" } }),
+        10000
+      )
+    );
+    const { error } = await Promise.race([upsert, timeout]);
     if (error) {
       broadcastLog({
         message: `Could not record protected channel ${title}: ${error.message}`,
