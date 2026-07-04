@@ -178,12 +178,26 @@ create table if not exists group_creation_queue (
   naming_pattern text not null,
   description text,
   messages jsonb,
+  type text not null default 'group',
   status text not null default 'pending',
   created_at timestamptz not null default now(),
   started_at timestamptz,
   completed_at timestamptz,
   error_message text
 );
+
+-- Add type column to group_creation_queue if it doesn't exist (safe to re-run).
+-- 'group' = megagroup/supergroup, 'channel' = broadcast channel.
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'group_creation_queue'
+    and column_name = 'type'
+  ) then
+    alter table group_creation_queue add column type text not null default 'group';
+  end if;
+end $$;
 
 -- Enable RLS for queue table
 alter table group_creation_queue enable row level security;

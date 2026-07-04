@@ -44,8 +44,10 @@ router.post(
 // Queue routes
 router.post("/queue/add", async (req: Request, res: Response) => {
   try {
-    const { phone, group_count, naming_pattern, description, messages } =
+    const { phone, group_count, naming_pattern, description, messages, type } =
       req.body;
+
+    const jobType = type === "channel" ? "channel" : "group";
 
     if (!phone || !group_count || !naming_pattern) {
       return res.status(400).json({
@@ -77,6 +79,7 @@ router.post("/queue/add", async (req: Request, res: Response) => {
         naming_pattern,
         description: description || "",
         messages: messages || [],
+        type: jobType,
         status: "pending",
         created_at: new Date().toISOString(),
       })
@@ -187,8 +190,11 @@ async function processNextQueueJob() {
       .update({ status: "processing", started_at: new Date().toISOString() })
       .eq("id", job.id);
 
+    const jobType: "group" | "channel" =
+      job.type === "channel" ? "channel" : "group";
+
     broadcastLog({
-      message: `Starting queued job #${job.id} for account ${job.phone} to create ${job.group_count} groups`,
+      message: `Starting queued job #${job.id} for account ${job.phone} to create ${job.group_count} ${jobType}s`,
       type: "info",
       timestamp: new Date().toISOString(),
     });
@@ -199,7 +205,8 @@ async function processNextQueueJob() {
         job.group_count,
         job.naming_pattern,
         job.description,
-        job.messages
+        job.messages,
+        jobType
       );
 
       await supabase
@@ -211,7 +218,7 @@ async function processNextQueueJob() {
         .eq("id", job.id);
 
       broadcastLog({
-        message: `Completed queued job #${job.id} for account ${job.phone} — created ${result.successfulGroups}/${result.totalGroups} groups`,
+        message: `Completed queued job #${job.id} for account ${job.phone} — created ${result.successfulGroups}/${result.totalGroups} ${jobType}s`,
         type: "success",
         timestamp: new Date().toISOString(),
       });
@@ -264,17 +271,25 @@ interface CreateGroupsResult {
   results: any[];
 }
 
-// Single source of truth for group creation logic
+// Single source of truth for group/channel creation logic
 async function createGroups(
   phone: string,
   groupCount: number,
   namingPattern: string,
   description?: string,
-  messages?: any[]
+  messages?: any[],
+  type: "group" | "channel" = "group"
 ): Promise<CreateGroupsResult> {
   // Serialize: only one account may be active at a time.
   return withAccountLock(() =>
-    createGroupsInner(phone, groupCount, namingPattern, description, messages)
+    createGroupsInner(
+      phone,
+      groupCount,
+      namingPattern,
+      description,
+      messages,
+      type
+    )
   );
 }
 
@@ -283,8 +298,10 @@ async function createGroupsInner(
   groupCount: number,
   namingPattern: string,
   description?: string,
-  messages?: any[]
+  messages?: any[],
+  type: "group" | "channel" = "group"
 ): Promise<CreateGroupsResult> {
+  const entity = type === "channel" ? "channel" : "group";
   let client: any = null;
 
   try {
@@ -343,7 +360,7 @@ async function createGroupsInner(
     let successfulGroups = 0;
 
     broadcastLog({
-      message: `Starting creation of ${groupCount} groups for account ${phone}`,
+      message: `Starting creation of ${groupCount} ${entity}s for account ${phone}`,
       type: "info",
       timestamp: new Date().toISOString(),
     });
@@ -364,14 +381,14 @@ async function createGroupsInner(
       let groupResult: any = { success: false, title };
 
       try {
-        const chat = await createSingleGroup(client, title, description);
+        const chat = await createSingleGroup(client, title, description, type);
         if (chat && chat.id) {
           groupResult.success = true;
           groupResult.id = chat.id;
           successfulGroups++;
 
           broadcastLog({
-            message: `Created group ${title} for account ${phone}`,
+            message: `Created ${entity} ${title} for account ${phone}`,
             type: "success",
             timestamp: new Date().toISOString(),
           });
@@ -388,7 +405,7 @@ async function createGroupsInner(
           }
         } else {
           broadcastLog({
-            message: `Failed to create group ${title} for account ${phone}`,
+            message: `Failed to create ${entity} ${title} for account ${phone}`,
             type: "error",
             timestamp: new Date().toISOString(),
           });
@@ -437,14 +454,19 @@ async function createGroupsInner(
 
           // Retry the group creation after waiting
           try {
-            const chat = await createSingleGroup(client, title, description);
+            const chat = await createSingleGroup(
+              client,
+              title,
+              description,
+              type
+            );
             if (chat && chat.id) {
               groupResult.success = true;
               groupResult.id = chat.id;
               successfulGroups++;
 
               broadcastLog({
-                message: `Successfully created group ${title} after flood wait retry`,
+                message: `Successfully created ${entity} ${title} after flood wait retry`,
                 type: "success",
                 timestamp: new Date().toISOString(),
               });
@@ -461,7 +483,7 @@ async function createGroupsInner(
               }
             } else {
               broadcastLog({
-                message: `Failed to create group ${title} after flood wait retry`,
+                message: `Failed to create ${entity} ${title} after flood wait retry`,
                 type: "error",
                 timestamp: new Date().toISOString(),
               });
@@ -551,14 +573,17 @@ async function createGroupsInner(
 async function createSingleGroup(
   client: any,
   title: string,
-  description?: string
+  description?: string,
+  type: "group" | "channel" = "group"
 ): Promise<any> {
+  const isChannel = type === "channel";
   const updates = await client.call({
     _: "channels.createChannel",
     title,
     about: description || "",
-    megagroup: true,
-    broadcast: false,
+    // A "group" is a megagroup (supergroup); a "channel" is a broadcast channel.
+    megagroup: !isChannel,
+    broadcast: isChannel,
   });
 
   if (
@@ -758,7 +783,10 @@ router.post("/groups/create", async (req: Request, res: Response) => {
     useCustomPattern,
     description,
     messages,
+    type,
   } = req.body;
+
+  const entityType = type === "channel" ? "channel" : "group";
 
   // Validate input
   if (!phone || typeof phone !== "string") {
@@ -791,7 +819,8 @@ router.post("/groups/create", async (req: Request, res: Response) => {
       count,
       namingPattern,
       description,
-      messages
+      messages,
+      entityType
     );
 
     // Get updated rate limit info
