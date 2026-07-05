@@ -1,10 +1,14 @@
 import dotenv from "dotenv";
 dotenv.config();
 import express from "express";
+import fileUpload from "express-fileupload";
+import fs from "fs";
+import path from "path";
 import routes from "./routes";
 import swaggerUi from "swagger-ui-express";
 import swaggerDocument from "../swagger.json";
 import { logSessionCount } from "./telegram/manager";
+import { UPLOADS_DIR } from "./routes";
 import http from "http";
 import WebSocket from "ws";
 import { setWebSocketClients, broadcastLog } from "./broadcast";
@@ -34,6 +38,19 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
+// Multipart handling for the messaging image upload (broadcast). Files are kept
+// in memory (req.files.<field>.data is a Buffer); the messaging endpoint persists
+// them to UPLOADS_DIR so the async scheduler can read them at send time.
+app.use(
+  fileUpload({
+    limits: { fileSize: 15 * 1024 * 1024 }, // 15 MB
+    abortOnLimit: true,
+  })
+);
+
+// Ensure the uploads directory exists for broadcast images.
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
 // Log session count on boot
 logSessionCount();
 
@@ -62,10 +79,11 @@ wss.on("connection", (ws) => {
 
 setWebSocketClients(wsClients);
 
-// Initialize queue processor after WebSocket setup
-import { startQueueProcessor } from "./routes";
+// Initialize queue processors after WebSocket setup
+import { startQueueProcessor, startMessagingProcessor } from "./routes";
 server.listen(PORT, () => {
   console.log(`Server running on ${BACKEND_URL}`);
   console.log(`Swagger docs at ${BACKEND_URL}/docs`);
   startQueueProcessor();
+  startMessagingProcessor();
 });

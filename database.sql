@@ -445,3 +445,72 @@ ON telegram_bots
 FOR ALL
 USING (true)
 WITH CHECK (true);
+
+-- ===========================================================================
+-- Messaging feature: bulk-send to an account's EXISTING channels or groups.
+-- Two shapes, one engine:
+--   • broadcast : send ONE message (text, or image+caption) to every chat now.
+--   • drip      : send X AI-generated messages per chat, spread over Y days.
+-- Chat IDs are NOT stored anywhere — each account's channels/groups are
+-- discovered live from Telegram (iterDialogs) at send time.
+-- ===========================================================================
+
+-- Parent row: one per user action. Holds the shared config, the (AI-generated
+-- or user-typed) message pool, and any uploaded image.
+create table if not exists messaging_jobs (
+  id serial primary key,
+  workspace text not null default 'default',   -- owner tag, see backend/src/workspace.ts
+  mode text not null,                          -- 'broadcast' | 'drip'
+  target_kind text not null,                   -- 'channel' | 'group'
+  -- content
+  message_pool jsonb,                          -- string[]; drip: len = total_rounds, broadcast: [text] or null
+  image_path text,                             -- broadcast image on disk (nullable)
+  caption text,                                -- broadcast image caption (nullable)
+  theme text,                                  -- drip: the AI prompt/theme used
+  -- schedule
+  total_rounds integer not null default 1,     -- messages per chat (broadcast = 1)
+  span_days numeric not null default 0,        -- spread window in days (broadcast = 0)
+  interval_ms bigint not null default 0,       -- gap between rounds = span_days*86400000 / total_rounds
+  send_delay_ms integer not null default 1500, -- gap between per-chat sends within a round
+  status text not null default 'active',       -- 'active' | 'completed' | 'failed' | 'cancelled'
+  created_at timestamptz not null default now(),
+  completed_at timestamptz,
+  error_message text
+);
+
+-- Child row: one per (job, account). Tracks that account's own progress and
+-- cooldown so the scheduler can round-robin and park flooded accounts
+-- independently — mirrors the bot-job fields on group_creation_queue.
+create table if not exists messaging_targets (
+  id serial primary key,
+  job_id integer not null references messaging_jobs(id) on delete cascade,
+  phone text not null references telegram_accounts(phone),
+  rounds_done integer not null default 0,      -- rounds completed for this account
+  sent_count integer not null default 0,       -- successful per-chat sends (progress/analytics)
+  chats_found integer,                         -- last discovery count (for UI display)
+  status text not null default 'pending',      -- 'pending' | 'processing' | 'completed' | 'failed'
+  next_attempt_at timestamptz,                 -- when this account's next round is due
+  error_message text
+);
+
+create index if not exists messaging_targets_job_id_idx on messaging_targets(job_id);
+create index if not exists messaging_targets_due_idx on messaging_targets(status, next_attempt_at);
+
+alter table messaging_jobs enable row level security;
+alter table messaging_targets enable row level security;
+grant all privileges on table messaging_jobs to service_role;
+grant all privileges on table messaging_targets to service_role;
+grant all privileges on sequence messaging_jobs_id_seq to service_role;
+grant all privileges on sequence messaging_targets_id_seq to service_role;
+
+CREATE POLICY "Allow full access to messaging_jobs"
+ON messaging_jobs
+FOR ALL
+USING (true)
+WITH CHECK (true);
+
+CREATE POLICY "Allow full access to messaging_targets"
+ON messaging_targets
+FOR ALL
+USING (true)
+WITH CHECK (true);

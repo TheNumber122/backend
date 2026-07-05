@@ -1,7 +1,8 @@
-// Groq-backed generator for Telegram bot usernames. Produces pronounceable,
-// brandable made-up handles ending in "bot" (e.g. cariovobot, nasionobot),
-// with NO numbers and NO underscores. Falls back to a local syllable generator
-// when GROQ_API_KEY is missing or the API errors, so bot creation never hard-fails.
+// Groq-backed generator for Telegram bot usernames. Produces brandable handles
+// made of TWO real English words ending in "bot" (e.g. oceandriverbot,
+// cryptowormbot), with NO numbers and NO underscores. AI-only: there is NO local
+// fallback. If a batch is too small or fails, it re-asks Groq, passing every
+// handle already produced/rejected in the prompt so it returns fresh words.
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "llama-3.3-70b-versatile";
@@ -23,6 +24,18 @@ function capitalizeFirst(s: string): string {
   return s.length ? s[0].toUpperCase() + s.slice(1) : s;
 }
 
+// Pick up to n random distinct items from a pool. Used to rotate the prompt
+// examples per call so the model doesn't keep anchoring on the same words.
+function pickSome<T>(pool: T[], n: number): T[] {
+  const copy = [...pool];
+  const out: T[] = [];
+  while (out.length < n && copy.length) {
+    const i = Math.floor(Math.random() * copy.length);
+    out.push(copy.splice(i, 1)[0]);
+  }
+  return out;
+}
+
 // Turn any model output into a clean, rule-compliant handle or null if unusable.
 // crypto mode: must start with "crypto" and end with "bot" or "robot".
 function sanitize(raw: unknown, mode: GenMode = "default"): string | null {
@@ -39,78 +52,62 @@ export function botDisplayName(username: string): string {
   return capitalizeFirst(username);
 }
 
-// Local fallback: consonant-vowel syllables + "bot". Deterministic-ish variety
-// without external calls. Not as creative as the LLM but always available.
-export function localBotUsernames(
-  count: number,
-  avoid: string[] = [],
-  mode: GenMode = "default"
-): string[] {
-  const cons = "bcdfgklmnprstvz".split("");
-  const vowels = "aeiou".split("");
-  const seen = new Set(avoid);
-  const out: string[] = [];
-  let guard = 0;
-  while (out.length < count && guard < count * 50) {
-    guard++;
-    const syllables = 2 + (guard % 2); // 2–3 syllables
-    let word = "";
-    for (let i = 0; i < syllables; i++) {
-      word += cons[(guard * 7 + i * 13) % cons.length];
-      word += vowels[(guard * 3 + i * 5) % vowels.length];
-      if (i < syllables - 1 && (guard + i) % 3 === 0) {
-        word += cons[(guard * 11 + i) % cons.length];
-      }
-    }
-    // crypto mode: prefix "crypto" and vary the bot/robot suffix for variety.
-    if (mode === "crypto") word = "crypto" + word + (guard % 2 ? "ro" : "");
-    const handle = sanitize(word, mode);
-    if (handle && !seen.has(handle)) {
-      seen.add(handle);
-      out.push(handle);
-    }
-  }
-  return out;
-}
+// How many times we re-ask Groq within one generateBotUsernames() call when a
+// batch comes back too small (duplicates/junk) or a transient API error hits.
+const MAX_ROUNDS = 4;
 
-export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]> {
-  const { count, theme, avoid = [], mode = "default" } = opts;
-  const want = count + BUFFER;
-  const key = process.env.GROQ_API_KEY;
-
-  if (!key) {
-    return localBotUsernames(want, avoid, mode);
-  }
-
+// Build the user prompt for one Groq request. `avoid` lists every handle already
+// produced or rejected — it goes straight into the prompt so the model returns
+// fresh words instead of repeating names we can't use.
+function buildUserPrompt(
+  want: number,
+  avoid: string[],
+  mode: GenMode,
+  theme?: string
+): string {
   const themeLine =
     mode === "custom" && theme
       ? `The names should subtly evoke this theme: "${theme}". Keep them brandable, not literal.`
       : "";
   const avoidLine = avoid.length
-    ? `Do NOT output any of these already-used names: ${avoid.join(", ")}.`
+    ? `Do NOT output any of these already-used or rejected names (or close variants): ${avoid.join(", ")}.`
     : "";
+
+  // Example pools are rotated per call (a random few each time) so the model
+  // stops anchoring on the same handful of words and repeating itself.
+  const cryptoExamplePool = [
+    "CryptoWormbot", "CryptoFalconbot", "CryptoEmberbot", "CryptoHarborbot",
+    "CryptoNomadbot", "CryptoQuartzbot", "CryptoWillowbot", "CryptoRangerbot",
+    "CryptoLanternbot", "CryptoCometrobot",
+  ];
+  const defaultExamplePool = [
+    "OceanDriverbot", "SilverFoxbot", "NightMarketbot", "IronPandabot",
+    "VelvetRiverbot", "CopperLanternbot", "BraveOtterbot", "MapleThunderbot",
+    "AmberFalconbot", "FrostHarborbot", "LunarNomadbot", "CrimsonPilotbot",
+  ];
 
   const rules =
     mode === "crypto"
       ? [
-          "- lowercase English letters a-z ONLY",
-          '- MUST start with "crypto" and MUST end with "bot" or "robot"',
+          '- MUST start with "crypto", then ONE real English word, then end with "bot" or "robot"',
+          "- lowercase English letters a-z ONLY in the final output",
           "- NO numbers, NO underscores, NO spaces, NO symbols",
           "- 9 to 24 characters long",
-          "- the middle is a short pronounceable invented segment",
-          'Good examples: cryptovexbot, cryptonovarobot, cryptozelbot, cryptolumbot.',
+          '- the word after "crypto" must be a real, meaningful English word (not invented)',
+          "- vary the words widely; do NOT reuse the example words below",
+          `Format examples (for shape only, do NOT copy these words): ${pickSome(cryptoExamplePool, 3).join(", ")}.`,
         ]
       : [
-          "- lowercase English letters a-z ONLY",
-          '- MUST end with the letters "bot"',
+          '- combine TWO real, meaningful English words, then end with the letters "bot"',
+          "- lowercase English letters a-z ONLY in the final output",
           "- NO numbers, NO underscores, NO spaces, NO symbols",
-          "- 6 to 20 characters long",
-          "- pronounceable, brandable, invented words (not real dictionary words)",
-          "- avoid common/obvious names likely already registered on Telegram",
-          "Good examples: cariovobot, nasionobot, unibopbot, rezotinrobot.",
+          "- 8 to 24 characters long",
+          "- both words must be real everyday English words (e.g. adjective + noun, or noun + noun)",
+          "- combine unexpected/unrelated word pairs for maximum variety; do NOT reuse the example words below",
+          `Format examples (for shape only, do NOT copy these words): ${pickSome(defaultExamplePool, 3).join(", ")}.`,
         ];
 
-  const userPrompt = [
+  return [
     `Generate ${want} unique Telegram bot usernames.`,
     "Strict rules:",
     ...rules,
@@ -120,59 +117,90 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
   ]
     .filter(Boolean)
     .join("\n");
+}
 
-  try {
-    const res = await fetch(GROQ_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
-      },
-      body: JSON.stringify({
-        model: GROQ_MODEL,
-        temperature: 1.05,
-        response_format: { type: "json_object" },
-        messages: [
-          {
-            role: "system",
-            content:
-              "You invent brandable, pronounceable Telegram bot usernames. You output strict JSON only.",
-          },
-          { role: "user", content: userPrompt },
-        ],
-      }),
-    });
+// One Groq request. Returns clean, rule-compliant handles not in `avoid`.
+// Throws on any network/API/parse error so the caller can retry — no fallback.
+async function callGroqOnce(
+  key: string,
+  want: number,
+  avoid: string[],
+  mode: GenMode,
+  theme?: string
+): Promise<string[]> {
+  const res = await fetch(GROQ_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${key}`,
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      temperature: 1.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You invent brandable, two-word Telegram bot usernames. You output strict JSON only.",
+        },
+        { role: "user", content: buildUserPrompt(want, avoid, mode, theme) },
+      ],
+    }),
+  });
 
-    if (!res.ok) {
-      throw new Error(`Groq HTTP ${res.status}`);
-    }
-
-    const data: any = await res.json();
-    const content = data?.choices?.[0]?.message?.content ?? "{}";
-    const parsed = JSON.parse(content);
-    const list: unknown[] = Array.isArray(parsed?.usernames)
-      ? parsed.usernames
-      : Array.isArray(parsed)
-      ? parsed
-      : [];
-
-    const seen = new Set(avoid);
-    const cleaned: string[] = [];
-    for (const item of list) {
-      const handle = sanitize(item, mode);
-      if (handle && !seen.has(handle)) {
-        seen.add(handle);
-        cleaned.push(handle);
-      }
-    }
-
-    // If the model under-delivered, top up locally so callers always get enough.
-    if (cleaned.length < count) {
-      cleaned.push(...localBotUsernames(want - cleaned.length, [...seen], mode));
-    }
-    return cleaned;
-  } catch {
-    // Any failure → local fallback, so the feature stays functional.
-    return localBotUsernames(want, avoid, mode);
+  if (!res.ok) {
+    throw new Error(`Groq HTTP ${res.status}`);
   }
+
+  const data: any = await res.json();
+  const content = data?.choices?.[0]?.message?.content ?? "{}";
+  const parsed = JSON.parse(content);
+  const list: unknown[] = Array.isArray(parsed?.usernames)
+    ? parsed.usernames
+    : Array.isArray(parsed)
+    ? parsed
+    : [];
+
+  const skip = new Set(avoid);
+  const cleaned: string[] = [];
+  for (const item of list) {
+    const handle = sanitize(item, mode);
+    if (handle && !skip.has(handle)) {
+      skip.add(handle);
+      cleaned.push(handle);
+    }
+  }
+  return cleaned;
+}
+
+export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]> {
+  const { count, theme, avoid = [], mode = "default" } = opts;
+  const key = process.env.GROQ_API_KEY;
+
+  // AI-only: with no key there is nothing to generate. Caller surfaces the error.
+  if (!key) return [];
+
+  // `seen` starts with the caller's avoid list (handles already rejected by
+  // BotFather this run) and grows every round, so each retry asks Groq for words
+  // it hasn't given us yet.
+  const seen = new Set(avoid);
+  const out: string[] = [];
+
+  for (let round = 0; round < MAX_ROUNDS && out.length < count; round++) {
+    const want = count - out.length + BUFFER;
+    try {
+      const batch = await callGroqOnce(key, want, [...seen], mode, theme);
+      for (const handle of batch) {
+        if (!seen.has(handle)) {
+          seen.add(handle);
+          out.push(handle);
+        }
+      }
+    } catch {
+      // Transient network/API error — just try another round.
+    }
+  }
+
+  return out;
 }

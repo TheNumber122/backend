@@ -1,4 +1,6 @@
 import express, { Request, Response } from "express";
+import fs from "fs";
+import path from "path";
 import { Conversation } from "@mtcute/node";
 import {
   getClientByPhone,
@@ -14,6 +16,14 @@ import { broadcastLog } from "./broadcast";
 import { getWorkspace } from "./workspace";
 import { generateBotUsernames, botDisplayName } from "./ai/groq";
 import { createBotViaBotFather } from "./telegram/botfather";
+import { listChatsForAccount, TargetKind } from "./telegram/dialogs";
+import { sendToChat, SendContent } from "./telegram/send";
+import { generateBroadcastMessages } from "./ai/messages";
+
+// Where broadcast images are persisted so the async messaging scheduler can read
+// them at send time (the request's in-memory buffer is gone by then). Created on
+// boot by server.ts.
+export const UPLOADS_DIR = path.join(__dirname, "..", "uploads");
 
 // Only channels created by accounts in THIS workspace get recorded into the
 // sister project's protected_channels table (so its auto-leave bot skips them).
@@ -964,52 +974,74 @@ async function createSingleBotInner(
       );
     }
 
-    // One AI call yields the primary handle plus a few spares (buffer), so a
-    // single /newbot cycle can absorb "username taken" collisions.
-    const candidates = await generateBotUsernames({ count: 1, theme: usernameTheme, mode });
-    if (candidates.length === 0) {
-      log(`No usernames generated for ${phone} (check GROQ_API_KEY / Groq status).`, "error");
-      return { status: "error" };
-    }
-    const primary = candidates[0];
-    log(
-      `Creating bot "${botDisplayName(primary)}" for ${phone} — trying @${candidates
-        .slice(0, 6)
-        .join(", @")}`
-    );
+    // Each AI call yields a primary handle plus a few spares (buffer), so a
+    // single /newbot cycle can absorb "username taken" collisions. If BotFather
+    // rejects EVERY candidate, we re-ask the AI for brand-new words, passing the
+    // rejected handles so it won't repeat them — no local fallback.
+    const MAX_USERNAME_ROUNDS = 3;
+    const rejected: string[] = [];
+    let lastReason: SingleBotResult["status"] = "no_username";
+    let lastRetryAfterMs: number | undefined;
 
-    const result = await createBotViaBotFather(
-      client,
-      botDisplayName(primary),
-      candidates.slice(0, 6),
-      log
-    );
-
-    if (result.ok) {
-      // Store what BotFather actually set as the name (from the primary handle).
-      await supabase.from("telegram_bots").insert({
-        workspace,
-        owner_phone: phone,
-        username: result.username,
-        display_name: botDisplayName(primary),
-        token: result.token,
-        theme: mode === "custom" ? theme || null : mode === "crypto" ? "crypto" : null,
+    for (let round = 0; round < MAX_USERNAME_ROUNDS; round++) {
+      const candidates = await generateBotUsernames({
+        count: 1,
+        theme: usernameTheme,
+        mode,
+        avoid: rejected, // handles BotFather already refused this run
       });
-      // Bumps both the total counter and the 3-per-24h daily counter atomically.
-      await supabase.rpc("register_bot_creation", { account_phone: phone });
-      // Log the handle only — never the raw token (the WS log is global).
-      log(`Created bot @${result.username} for account ${phone}.`, "success");
-      return { status: "created", username: result.username };
+      if (candidates.length === 0) {
+        log(`No usernames generated for ${phone} (check GROQ_API_KEY / Groq status).`, "error");
+        return { status: "error" };
+      }
+      const primary = candidates[0];
+      log(
+        `Creating bot "${botDisplayName(primary)}" for ${phone} — trying @${candidates
+          .slice(0, 6)
+          .join(", @")}`
+      );
+
+      const result = await createBotViaBotFather(
+        client,
+        botDisplayName(primary),
+        candidates.slice(0, 6),
+        log
+      );
+
+      if (result.ok) {
+        // Store what BotFather actually set as the name (from the primary handle).
+        await supabase.from("telegram_bots").insert({
+          workspace,
+          owner_phone: phone,
+          username: result.username,
+          display_name: botDisplayName(primary),
+          token: result.token,
+          theme: mode === "custom" ? theme || null : mode === "crypto" ? "crypto" : null,
+        });
+        // Bumps both the total counter and the 3-per-24h daily counter atomically.
+        await supabase.rpc("register_bot_creation", { account_phone: phone });
+        // Log the handle only — never the raw token (the WS log is global).
+        log(`Created bot @${result.username} for account ${phone}.`, "success");
+        return { status: "created", username: result.username };
+      }
+
+      lastReason = result.reason;
+      lastRetryAfterMs =
+        result.reason === "flood" && result.retryAfter ? result.retryAfter * 1000 : undefined;
+
+      // Only "all candidates rejected" is worth another AI round. limit / flood /
+      // timeout are account-level conditions the scheduler must handle, so stop.
+      if (result.reason !== "no_username") break;
+
+      rejected.push(...result.tried);
+      log(
+        `All candidates rejected for ${phone}; regenerating usernames avoiding ${rejected.length} used handle(s)...`
+      );
     }
 
-    // Surface BotFather's exact "try again in N seconds" delay for flood cases.
-    return {
-      status: result.reason,
-      retryAfterMs:
-        result.reason === "flood" && result.retryAfter
-          ? result.retryAfter * 1000
-          : undefined,
-    };
+    // Exhausted rounds (or hit a non-retryable reason). Surface the last reason,
+    // preserving BotFather's "try again in N seconds" delay for flood cases.
+    return { status: lastReason, retryAfterMs: lastRetryAfterMs };
   } catch (err: any) {
     log(`Unexpected error creating bot for ${phone}: ${err?.message || err}`, "error");
     return { status: "error" };
@@ -1527,6 +1559,504 @@ router.get("/bots", async (req: Request, res: Response) => {
     return res
       .status(500)
       .json({ success: false, error: err.message || "Failed to fetch bots" });
+  }
+});
+
+// ===========================================================================
+// MESSAGING: bulk-send to an account's EXISTING channels or groups.
+//   • broadcast — one message (text, or image+caption) to every chat, now.
+//   • drip      — X AI-generated messages per chat, one per round, spread over
+//                 Y days (interval_ms between rounds).
+// Chats are discovered live per round via iterDialogs (no stored chat IDs).
+// Runs on its own scheduler but shares withAccountLock with the bot/group
+// scheduler, so only one account is ever online at a time.
+// ===========================================================================
+
+let isProcessingMessaging = false;
+
+const MESSAGING_INTER_ACCOUNT_MS = 15 * 1000; // breather after each account
+const MESSAGING_FLOOD_DEFAULT_MS = 15 * 60 * 1000; // park time when flood gives no number
+const MESSAGING_CANCEL_CHECK_EVERY = 25; // re-check cancellation every N sends
+
+function mlog(message: string, type: "info" | "success" | "error" = "info") {
+  broadcastLog({ message, type, timestamp: new Date().toISOString() });
+}
+
+// Delete a broadcast job's uploaded image from disk (best-effort).
+function cleanupJobImage(job: any) {
+  if (job?.image_path) {
+    fs.promises.unlink(job.image_path).catch(() => {});
+  }
+}
+
+// Mark the parent job completed once none of its accounts are still pending.
+async function maybeCompleteMessagingJob(jobId: number) {
+  const { data: remaining } = await supabase
+    .from("messaging_targets")
+    .select("id")
+    .eq("job_id", jobId)
+    .in("status", ["pending", "processing"])
+    .limit(1);
+  if (remaining && remaining.length) return;
+
+  const { data: job } = await supabase
+    .from("messaging_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .single();
+  if (!job || job.status !== "active") return;
+
+  await supabase
+    .from("messaging_jobs")
+    .update({ status: "completed", completed_at: new Date().toISOString() })
+    .eq("id", jobId);
+  cleanupJobImage(job);
+  mlog(`Messaging job #${jobId} complete.`, "success");
+}
+
+// Run ONE round for one account: discover its chats and send this round's
+// message to each. Advances the target's progress / cooldown; never throws.
+async function runOneMessagingRound(target: any, job: any) {
+  const nowIso = () => new Date().toISOString();
+  const kind: TargetKind = job.target_kind === "channel" ? "channel" : "group";
+  const round = target.rounds_done ?? 0;
+
+  // First touch: flip pending → processing.
+  if (target.status === "pending") {
+    await supabase
+      .from("messaging_targets")
+      .update({ status: "processing" })
+      .eq("id", target.id);
+  }
+
+  // Resolve this round's content.
+  let content: SendContent;
+  try {
+    if (job.mode === "broadcast" && job.image_path) {
+      const file = await fs.promises.readFile(job.image_path);
+      content = { kind: "photo", file, caption: job.caption || undefined };
+    } else {
+      const pool: string[] = Array.isArray(job.message_pool) ? job.message_pool : [];
+      const text = pool.length ? pool[round % pool.length] : "";
+      if (!text) {
+        // Nothing to send (shouldn't happen — validated at creation).
+        await supabase
+          .from("messaging_targets")
+          .update({ status: "failed", error_message: "No message content." })
+          .eq("id", target.id);
+        await maybeCompleteMessagingJob(job.id);
+        return;
+      }
+      content = { kind: "text", text };
+    }
+  } catch (err: any) {
+    await supabase
+      .from("messaging_targets")
+      .update({ status: "failed", error_message: `Content error: ${err?.message || err}` })
+      .eq("id", target.id);
+    await maybeCompleteMessagingJob(job.id);
+    return;
+  }
+
+  let sent = 0;
+  let skipped = 0;
+  let flooded = false;
+
+  await withAccountLock(async () => {
+    let client: any = null;
+    try {
+      client = await getClientByPhone(target.phone);
+      const chats = await listChatsForAccount(client, kind);
+      await supabase
+        .from("messaging_targets")
+        .update({ chats_found: chats.length })
+        .eq("id", target.id);
+
+      mlog(
+        `Job #${job.id} · ${target.phone}: found ${chats.length} ${kind}(s) — ` +
+          `round ${round + 1}/${job.total_rounds}.`
+      );
+
+      for (let i = 0; i < chats.length; i++) {
+        // Periodically honor a mid-round cancellation.
+        if (i > 0 && i % MESSAGING_CANCEL_CHECK_EVERY === 0) {
+          const { data: fresh } = await supabase
+            .from("messaging_jobs")
+            .select("status")
+            .eq("id", job.id)
+            .single();
+          if (!fresh || fresh.status !== "active") {
+            mlog(`Job #${job.id} cancelled — stopping ${target.phone} mid-round.`);
+            return;
+          }
+        }
+
+        const chat = chats[i];
+        const result = await sendToChat(client, chat.peer, content);
+        if (result.status === "ok") {
+          sent++;
+        } else if (result.status === "skip") {
+          skipped++;
+        } else if (result.status === "flood") {
+          // Whole account is rate-limited — park it and resume this round later.
+          flooded = true;
+          const waitSeconds = await handleTelegramRateLimit(target.phone, result.error);
+          const waitMs = waitSeconds ? waitSeconds * 1000 : MESSAGING_FLOOD_DEFAULT_MS;
+          const nextAt = new Date(Date.now() + waitMs).toISOString();
+          await supabase
+            .from("messaging_targets")
+            .update({
+              status: "processing",
+              next_attempt_at: nextAt,
+              sent_count: (target.sent_count ?? 0) + sent,
+            })
+            .eq("id", target.id);
+          mlog(
+            `Job #${job.id} · ${target.phone}: flood wait — parked ~${Math.round(
+              waitMs / 60000
+            )} min, will resume this round. (${sent} sent before flood)`,
+            "error"
+          );
+          return;
+        }
+
+        if (i < chats.length - 1) await sleep(job.send_delay_ms || 1500);
+      }
+    } catch (err: any) {
+      // Couldn't bring the account online (dead session, etc.) — fail this
+      // account so the job can complete; other accounts are unaffected.
+      await supabase
+        .from("messaging_targets")
+        .update({
+          status: "failed",
+          error_message: `Account error: ${err?.message || err}`,
+          sent_count: (target.sent_count ?? 0) + sent,
+        })
+        .eq("id", target.id);
+      mlog(`Job #${job.id} · ${target.phone}: account error — ${err?.message || err}`, "error");
+      return;
+    } finally {
+      if (client) {
+        try {
+          await clearSession(target.phone);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  });
+
+  if (flooded) return; // already rescheduled inside the lock
+
+  // Round finished: advance progress.
+  const newSent = (target.sent_count ?? 0) + sent;
+  const newRounds = round + 1;
+  if (newRounds >= job.total_rounds) {
+    await supabase
+      .from("messaging_targets")
+      .update({ status: "completed", rounds_done: newRounds, sent_count: newSent, next_attempt_at: null })
+      .eq("id", target.id);
+    mlog(
+      `Job #${job.id} · ${target.phone}: done — ${newRounds}/${job.total_rounds} round(s), ` +
+        `${newSent} total sent (${skipped} skipped this round).`,
+      "success"
+    );
+    await maybeCompleteMessagingJob(job.id);
+  } else {
+    const nextAt = new Date(Date.now() + Number(job.interval_ms || 0)).toISOString();
+    await supabase
+      .from("messaging_targets")
+      .update({ status: "processing", rounds_done: newRounds, sent_count: newSent, next_attempt_at: nextAt })
+      .eq("id", target.id);
+    const mins = Number(job.interval_ms || 0) / 60000;
+    mlog(
+      `Job #${job.id} · ${target.phone}: round ${newRounds}/${job.total_rounds} sent ` +
+        `(${sent} ok, ${skipped} skipped). Next round in ~${
+          mins >= 1 ? Math.round(mins) + " min" : Math.round(mins * 60) + "s"
+        }.`
+    );
+  }
+}
+
+async function processMessagingQueue() {
+  if (isProcessingMessaging) return;
+  isProcessingMessaging = true;
+  try {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      // Only consider targets whose parent job is still active.
+      const { data: activeJobs } = await supabase
+        .from("messaging_jobs")
+        .select("id")
+        .eq("status", "active");
+      const ids = (activeJobs || []).map((j: any) => j.id);
+      if (!ids.length) return;
+
+      const { data: target } = await supabase
+        .from("messaging_targets")
+        .select("*")
+        .in("job_id", ids)
+        .in("status", ["pending", "processing"])
+        .order("next_attempt_at", { ascending: true, nullsFirst: true })
+        .order("id", { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      if (!target) return; // nothing left to do
+
+      const dueAt = target.next_attempt_at
+        ? new Date(target.next_attempt_at).getTime()
+        : 0;
+      const waitMs = dueAt - Date.now();
+      if (waitMs > 0) {
+        await sleep(Math.min(waitMs, SCHEDULER_MAX_SLEEP_MS));
+        continue;
+      }
+
+      const { data: job } = await supabase
+        .from("messaging_jobs")
+        .select("*")
+        .eq("id", target.job_id)
+        .single();
+      if (!job || job.status !== "active") continue;
+
+      await runOneMessagingRound(target, job);
+      await sleep(MESSAGING_INTER_ACCOUNT_MS);
+    }
+  } catch (err: any) {
+    mlog(`Error in messaging scheduler: ${err?.message || "Unknown error"}`, "error");
+  } finally {
+    isProcessingMessaging = false;
+  }
+}
+
+// Resume any in-flight messaging jobs on boot (drips can span days).
+export function startMessagingProcessor() {
+  processMessagingQueue();
+}
+
+// ----- Messaging endpoints -------------------------------------------------
+
+// Normalize a body field that may arrive as a real value (JSON request) or a
+// string (multipart request from express-fileupload).
+function asArray(v: any): any[] {
+  if (Array.isArray(v)) return v;
+  if (typeof v === "string") {
+    try {
+      const parsed = JSON.parse(v);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+// POST /messaging/messages/preview — generate an AI message pool the user can
+// review/edit before launching a drip. One Groq call.
+router.post("/messaging/messages/preview", async (req: Request, res: Response) => {
+  try {
+    const { theme } = req.body;
+    const count = Math.max(1, Math.min(30, Number(req.body.count) || 1));
+    if (!theme || typeof theme !== "string") {
+      return res.status(400).json({ success: false, error: "A theme is required." });
+    }
+    const messages = await generateBroadcastMessages(theme, count);
+    return res.json({ success: true, data: { messages } });
+  } catch (err: any) {
+    return res
+      .status(500)
+      .json({ success: false, error: err?.message || "Failed to generate messages." });
+  }
+});
+
+// POST /messaging/jobs — create a broadcast or drip job.
+// Accepts JSON, or multipart/form-data when a broadcast image is attached.
+router.post("/messaging/jobs", async (req: Request, res: Response) => {
+  try {
+    const ws = getWorkspace(req);
+    const body = req.body || {};
+
+    const mode = body.mode === "drip" ? "drip" : body.mode === "broadcast" ? "broadcast" : null;
+    const targetKind: TargetKind =
+      body.targetKind === "channel" ? "channel" : body.targetKind === "group" ? "group" : "group";
+    if (!mode) {
+      return res.status(400).json({ success: false, error: "mode must be 'broadcast' or 'drip'." });
+    }
+    if (body.targetKind !== "channel" && body.targetKind !== "group") {
+      return res.status(400).json({ success: false, error: "targetKind must be 'channel' or 'group'." });
+    }
+
+    const accounts = asArray(body.accounts).filter((p) => typeof p === "string");
+    if (!accounts.length) {
+      return res.status(400).json({ success: false, error: "Select at least one account." });
+    }
+
+    // Only allow accounts owned by this workspace.
+    const { data: owned } = await supabase
+      .from("telegram_accounts")
+      .select("phone")
+      .eq("workspace", ws)
+      .in("phone", accounts);
+    const ownedPhones = new Set((owned || []).map((a: any) => a.phone));
+    const phones = accounts.filter((p) => ownedPhones.has(p));
+    if (!phones.length) {
+      return res.status(404).json({ success: false, error: "None of the selected accounts were found." });
+    }
+
+    // Build the job row per mode.
+    let jobRow: any = {
+      workspace: ws,
+      mode,
+      target_kind: targetKind,
+      status: "active",
+      send_delay_ms: Math.max(500, Math.min(10000, Number(body.sendDelayMs) || 1500)),
+      created_at: new Date().toISOString(),
+    };
+
+    const imageFile: any = (req as any).files?.image;
+
+    if (mode === "broadcast") {
+      const text = typeof body.text === "string" ? body.text.trim() : "";
+      const caption = typeof body.caption === "string" ? body.caption.trim() : "";
+      if (!imageFile && !text) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Provide a message or an image." });
+      }
+      jobRow = {
+        ...jobRow,
+        total_rounds: 1,
+        span_days: 0,
+        interval_ms: 0,
+        message_pool: text ? [text] : null,
+        caption: imageFile ? caption || null : null,
+      };
+    } else {
+      // drip
+      const total = Math.max(1, Math.min(30, Number(body.messagesPerChat) || 1));
+      const spanDays = Math.max(0.001, Math.min(60, Number(body.spanDays) || 1));
+      const theme = typeof body.theme === "string" ? body.theme.trim() : "";
+      const edited = asArray(body.messages).filter((m) => typeof m === "string" && m.trim());
+
+      let pool: string[];
+      if (edited.length) {
+        pool = edited.slice(0, total);
+        while (pool.length < total) pool.push(pool[pool.length % Math.max(1, edited.length)]);
+      } else {
+        if (!theme) {
+          return res
+            .status(400)
+            .json({ success: false, error: "Provide a theme or an edited message list." });
+        }
+        pool = await generateBroadcastMessages(theme, total);
+      }
+
+      jobRow = {
+        ...jobRow,
+        total_rounds: total,
+        span_days: spanDays,
+        interval_ms: Math.floor((spanDays * 86400000) / total),
+        message_pool: pool,
+        theme: theme || null,
+      };
+    }
+
+    const { data: job, error: jobError } = await supabase
+      .from("messaging_jobs")
+      .insert(jobRow)
+      .select()
+      .single();
+    if (jobError || !job) {
+      return res
+        .status(500)
+        .json({ success: false, error: `Failed to create job: ${jobError?.message}` });
+    }
+
+    // Persist a broadcast image now that we have the job id.
+    if (mode === "broadcast" && imageFile) {
+      const ext = (path.extname(imageFile.name || "") || ".jpg").slice(0, 5);
+      const dest = path.join(UPLOADS_DIR, `${job.id}${ext}`);
+      try {
+        await fs.promises.mkdir(UPLOADS_DIR, { recursive: true });
+        await fs.promises.writeFile(dest, imageFile.data);
+        await supabase.from("messaging_jobs").update({ image_path: dest }).eq("id", job.id);
+        job.image_path = dest;
+      } catch (err: any) {
+        await supabase.from("messaging_jobs").delete().eq("id", job.id);
+        return res
+          .status(500)
+          .json({ success: false, error: `Failed to store image: ${err?.message || err}` });
+      }
+    }
+
+    // One target row per account.
+    const targetRows = phones.map((phone) => ({ job_id: job.id, phone, status: "pending" }));
+    const { error: targetError } = await supabase.from("messaging_targets").insert(targetRows);
+    if (targetError) {
+      await supabase.from("messaging_jobs").delete().eq("id", job.id);
+      cleanupJobImage(job);
+      return res
+        .status(500)
+        .json({ success: false, error: `Failed to create targets: ${targetError.message}` });
+    }
+
+    mlog(
+      `Messaging job #${job.id} created: ${mode} to ${targetKind}s across ${phones.length} account(s)` +
+        (mode === "drip" ? ` — ${jobRow.total_rounds} msg/chat over ${jobRow.span_days} day(s).` : "."),
+      "info"
+    );
+
+    processMessagingQueue();
+    return res.json({ success: true, data: { job_id: job.id } });
+  } catch (err: any) {
+    return res
+      .status(500)
+      .json({ success: false, error: err?.message || "Unexpected error." });
+  }
+});
+
+// GET /messaging/jobs — list jobs (with per-account progress) for the workspace.
+router.get("/messaging/jobs", async (req: Request, res: Response) => {
+  try {
+    const ws = getWorkspace(req);
+    const { data: jobs, error } = await supabase
+      .from("messaging_jobs")
+      .select("*, targets:messaging_targets(*)")
+      .eq("workspace", ws)
+      .order("created_at", { ascending: false });
+    if (error) {
+      return res.status(500).json({ success: false, error: `Failed to list jobs: ${error.message}` });
+    }
+    return res.json({ success: true, data: jobs || [] });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || "Unexpected error." });
+  }
+});
+
+// DELETE /messaging/jobs/:id — cancel a job (scheduler skips non-active jobs).
+router.delete("/messaging/jobs/:id", async (req: Request, res: Response) => {
+  try {
+    const ws = getWorkspace(req);
+    const { id } = req.params;
+    const { data: job } = await supabase
+      .from("messaging_jobs")
+      .select("*")
+      .eq("id", id)
+      .eq("workspace", ws)
+      .single();
+    if (!job) {
+      return res.status(404).json({ success: false, error: "Job not found." });
+    }
+    await supabase
+      .from("messaging_jobs")
+      .update({ status: "cancelled", completed_at: new Date().toISOString() })
+      .eq("id", id)
+      .eq("workspace", ws);
+    cleanupJobImage(job);
+    return res.json({ success: true, message: `Job ${id} cancelled.` });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || "Unexpected error." });
   }
 });
 
