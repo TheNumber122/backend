@@ -259,6 +259,11 @@ function backoffForBotFailure(res: SingleBotResult): {
 } {
   if (res.status === "flood") {
     if (res.retryAfterMs && res.retryAfterMs > 0) {
+      // Absurdly long floods (>40000s ≈ 11h) mean the account is toast for the
+      // day — just park it 24h rather than honoring the exact (huge) number.
+      if (res.retryAfterMs > 40000 * 1000) {
+        return { ms: 24 * 60 * 60 * 1000, detail: "flood >40000s → parked 24h" };
+      }
       const ms = Math.min(
         Math.max(res.retryAfterMs + 5000, BOT_FLOOD_MIN_MS),
         BOT_FLOOD_MAX_MS
