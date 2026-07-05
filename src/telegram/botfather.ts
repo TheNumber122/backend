@@ -11,7 +11,7 @@ import { Conversation } from "@mtcute/node";
 
 const BOTFATHER = "botfather";
 const STEP_TIMEOUT = 45000; // ms to wait for each BotFather reply
-const SEND_DELAY = 2000; // ms between our messages (look human, avoid flood)
+const SEND_DELAY = 800; // ms between our messages (small gap; daily cap is the real guard)
 
 export type LogFn = (message: string, type?: "info" | "success" | "error") => void;
 
@@ -46,7 +46,12 @@ function classifyUsernameReply(
   if (TOKEN_RE.test(text)) return "success";
   const t = text.toLowerCase();
   if (/already taken|is already in use|already exists/.test(t)) return "taken";
-  if (/too many bots|maximum number of bots|20 bots/.test(t)) return "limit";
+  if (
+    /too many bots|maximum number of bots|(can'?t|cannot) add more than|delete one of your bots|20 bots|40 bots/.test(
+      t
+    )
+  )
+    return "limit";
   if (/too many attempts|try again later|flood/.test(t)) return "flood";
   if (
     /invalid|i don'?t like|too short|too long|must end|username must|not a valid|can't use|sorry, this username/.test(
@@ -61,7 +66,12 @@ function classifyPreUsernameReply(
   text: string
 ): "ask_username" | "ask_name" | "limit" | "flood" | "unknown" {
   const t = text.toLowerCase();
-  if (/too many bots|maximum number of bots|20 bots/.test(t)) return "limit";
+  if (
+    /too many bots|maximum number of bots|(can'?t|cannot) add more than|delete one of your bots|20 bots|40 bots/.test(
+      t
+    )
+  )
+    return "limit";
   if (/too many attempts|try again later|flood/.test(t)) return "flood";
   if (/username/.test(t)) return "ask_username";
   if (/name/.test(t)) return "ask_name";

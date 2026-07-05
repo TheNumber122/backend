@@ -13,7 +13,11 @@ create table if not exists telegram_accounts (
   workspace text not null default 'default',
   -- Bots created via BotFather for this account. Telegram caps this at 20 per
   -- account; we force it to 20 when BotFather reports the cap (see routes.ts).
-  bots_count integer not null default 0
+  bots_count integer not null default 0,
+  -- Rolling 24h bot-creation limit (max 3/day). bots_next_reset marks when the
+  -- window (started on the first creation) resets bots_created_24h back to 0.
+  bots_created_24h integer not null default 0,
+  bots_next_reset timestamptz
 );
 
 -- Enable RLS
@@ -209,7 +213,77 @@ begin
   ) then
     alter table telegram_accounts add column bots_count integer not null default 0;
   end if;
+
+  -- Rolling 24h bot-creation limit (max 3/day).
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'telegram_accounts' and column_name = 'bots_created_24h'
+  ) then
+    alter table telegram_accounts add column bots_created_24h integer not null default 0;
+  end if;
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'telegram_accounts' and column_name = 'bots_next_reset'
+  ) then
+    alter table telegram_accounts add column bots_next_reset timestamptz;
+  end if;
 end $$;
+
+-- Check both bot limits for an account, resetting the 24h window if it elapsed.
+-- Returns json: { can_create, reason, bots_count, bots_created_24h, next_reset }.
+-- reason ∈ 'total' (hit 20 cap) | 'daily' (hit 3/24h) | null (can create).
+create or replace function check_bot_limits(account_phone text)
+returns json
+language plpgsql
+as $$
+declare
+  acct telegram_accounts;
+  now_ts timestamptz := now();
+begin
+  select * into acct from telegram_accounts where phone = account_phone;
+  if acct is null then
+    return json_build_object('can_create', false, 'reason', 'not_found');
+  end if;
+
+  -- Reset the daily window once it has elapsed.
+  if acct.bots_next_reset is not null and now_ts >= acct.bots_next_reset then
+    update telegram_accounts
+    set bots_created_24h = 0, bots_next_reset = null
+    where phone = account_phone;
+    acct.bots_created_24h := 0;
+    acct.bots_next_reset := null;
+  end if;
+
+  if acct.bots_count >= 20 then
+    return json_build_object('can_create', false, 'reason', 'total',
+      'bots_count', acct.bots_count);
+  end if;
+
+  if acct.bots_created_24h >= 3 then
+    return json_build_object('can_create', false, 'reason', 'daily',
+      'bots_count', acct.bots_count, 'bots_created_24h', acct.bots_created_24h,
+      'next_reset', acct.bots_next_reset);
+  end if;
+
+  return json_build_object('can_create', true, 'bots_count', acct.bots_count,
+    'bots_created_24h', acct.bots_created_24h);
+end;
+$$;
+
+-- Record one successful bot creation: bump total + daily counters and start the
+-- 24h window on the first creation (it does not slide on later creations).
+create or replace function register_bot_creation(account_phone text)
+returns void
+language plpgsql
+as $$
+begin
+  update telegram_accounts
+  set bots_count = bots_count + 1,
+      bots_created_24h = bots_created_24h + 1,
+      bots_next_reset = coalesce(bots_next_reset, now() + interval '24 hours')
+  where phone = account_phone;
+end;
+$$;
 
 -- Increment the bot counter for an account (mirrors increment_groups_count).
 create or replace function increment_bots_count(phone_number text, increment_amount integer)
@@ -285,7 +359,12 @@ create table if not exists group_creation_queue (
   completed_at timestamptz,
   error_message text,
   -- Owner tag, mirrors telegram_accounts.workspace. See backend/src/workspace.ts.
-  workspace text not null default 'default'
+  workspace text not null default 'default',
+  -- Bot-job fields (unused by group/channel jobs). Bot jobs are processed one bot
+  -- at a time by the round-robin scheduler; these track progress + cooldown.
+  bots_done integer not null default 0,        -- bots created so far for this job
+  bots_attempts integer not null default 0,    -- failed attempts (runaway guard)
+  next_attempt_at timestamptz                  -- earliest time the next bot may run
 );
 
 -- Add type column to group_creation_queue if it doesn't exist (safe to re-run).
@@ -307,6 +386,26 @@ begin
     and column_name = 'workspace'
   ) then
     alter table group_creation_queue add column workspace text not null default 'default';
+  end if;
+
+  -- Bot-job progress/cooldown columns (safe to re-run).
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'group_creation_queue' and column_name = 'bots_done'
+  ) then
+    alter table group_creation_queue add column bots_done integer not null default 0;
+  end if;
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'group_creation_queue' and column_name = 'bots_attempts'
+  ) then
+    alter table group_creation_queue add column bots_attempts integer not null default 0;
+  end if;
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'group_creation_queue' and column_name = 'next_attempt_at'
+  ) then
+    alter table group_creation_queue add column next_attempt_at timestamptz;
   end if;
 end $$;
 

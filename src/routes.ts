@@ -151,7 +151,7 @@ router.post("/queue/add", async (req: Request, res: Response) => {
     }
 
     // Start processing queue if not already running
-    processNextQueueJob();
+    processQueue();
 
     return res.json({
       success: true,
@@ -224,124 +224,312 @@ router.delete("/queue/:id", async (req: Request, res: Response) => {
   }
 });
 
-// Process the next job in the queue
-async function processNextQueueJob() {
+// Short spacing between consecutive bot creations on the SAME account. The real
+// safety gate is the 3-per-24h daily limit (check_bot_limits), so this is just a
+// light anti-flood gap — kept small for speed. Override via env.
+const BOT_COOLDOWN_MS = Number(process.env.BOT_COOLDOWN_MS) || 60 * 1000;
+// Longer back-off when BotFather actively rate-limits ("too many attempts").
+const BOT_FLOOD_BACKOFF_MS =
+  Number(process.env.BOT_FLOOD_BACKOFF_MS) || 30 * 60 * 1000;
+// Cap on a single cooldown sleep so newly-enqueued jobs get picked up promptly.
+const SCHEDULER_MAX_SLEEP_MS = 60 * 1000;
+// Give up on a bot job after this many failed attempts (per job) to avoid loops.
+const MAX_BOT_FAILURES = 12;
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// The single queue scheduler. Each iteration runs one "unit" of work:
+//   • a full group/channel batch job (priority), OR
+//   • ONE bot for the least-recently-served bot job (round-robin), honoring the
+//     per-account cooldown.
+// Only one account is ever online at a time (withAccountLock), so everything is
+// serialized; round-robin simply spreads each account's bots over time and lets
+// the 5-min cooldown elapse while other accounts are worked.
+async function processQueue() {
   if (isProcessingQueue) return;
-
+  isProcessingQueue = true;
   try {
-    isProcessingQueue = true;
+    // Loop until no work remains; then release so a future enqueue restarts us.
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      // 1. Group/channel batch jobs take priority and run to completion.
+      const { data: batchJob } = await supabase
+        .from("group_creation_queue")
+        .select("*")
+        .eq("status", "pending")
+        .in("type", ["group", "channel"])
+        .order("created_at", { ascending: true })
+        .limit(1)
+        .maybeSingle();
 
-    // Get the next pending job
-    const { data: job, error } = await supabase
-      .from("group_creation_queue")
-      .select("*")
-      .eq("status", "pending")
-      .order("created_at", { ascending: true })
-      .limit(1)
-      .single();
-
-    if (error || !job) {
-      isProcessingQueue = false;
-      return;
-    }
-
-    // Mark job as started
-    await supabase
-      .from("group_creation_queue")
-      .update({ status: "processing", started_at: new Date().toISOString() })
-      .eq("id", job.id);
-
-    const isBotJob = job.type === "bot";
-    const jobType: "group" | "channel" =
-      job.type === "channel" ? "channel" : "group";
-    const jobLabel = isBotJob ? "bot" : jobType;
-
-    broadcastLog({
-      message: `Starting queued job #${job.id} for account ${job.phone} to create ${job.group_count} ${jobLabel}s`,
-      type: "info",
-      timestamp: new Date().toISOString(),
-    });
-
-    try {
-      let completedMsg: string;
-
-      if (isBotJob) {
-        // Bot jobs store the pattern choice in naming_pattern ('default'|'custom')
-        // and the theme in description.
-        const botResult = await createBots(
-          job.phone,
-          job.group_count,
-          job.naming_pattern === "custom",
-          job.description || undefined,
-          job.workspace || "default"
-        );
-        completedMsg = `Completed queued job #${job.id} for account ${job.phone} — created ${botResult.botsCreated}/${botResult.totalBots} bots`;
-      } else {
-        const result = await createGroups(
-          job.phone,
-          job.group_count,
-          job.naming_pattern,
-          job.description,
-          job.messages,
-          jobType,
-          job.workspace || "default"
-        );
-        completedMsg = `Completed queued job #${job.id} for account ${job.phone} — created ${result.successfulGroups}/${result.totalGroups} ${jobType}s`;
+      if (batchJob) {
+        await runBatchJob(batchJob);
+        continue;
       }
 
-      await supabase
+      // 2. Bot jobs: pick the one due soonest (null next_attempt_at = never
+      //    served = go now). Round-robin falls out of ordering by next_attempt_at.
+      const { data: botJob } = await supabase
         .from("group_creation_queue")
-        .update({
-          status: "completed",
-          completed_at: new Date().toISOString(),
-        })
-        .eq("id", job.id);
+        .select("*")
+        .eq("type", "bot")
+        .in("status", ["pending", "processing"])
+        .order("next_attempt_at", { ascending: true, nullsFirst: true })
+        .order("created_at", { ascending: true })
+        .limit(1)
+        .maybeSingle();
 
-      broadcastLog({
-        message: completedMsg,
-        type: "success",
-        timestamp: new Date().toISOString(),
-      });
-    } catch (err: any) {
-      await supabase
-        .from("group_creation_queue")
-        .update({
-          status: "failed",
-          completed_at: new Date().toISOString(),
-          error_message: err.message || "Unknown error",
-        })
-        .eq("id", job.id);
+      if (!botJob) return; // nothing left to do
 
-      broadcastLog({
-        message: `Failed queued job #${job.id} for account ${job.phone}: ${
-          err.message || "Unknown error"
-        }`,
-        type: "error",
-        timestamp: new Date().toISOString(),
-      });
+      const dueAt = botJob.next_attempt_at
+        ? new Date(botJob.next_attempt_at).getTime()
+        : 0;
+      const waitMs = dueAt - Date.now();
+      if (waitMs > 0) {
+        // Every remaining bot job is still cooling down — wait for the soonest.
+        await sleep(Math.min(waitMs, SCHEDULER_MAX_SLEEP_MS));
+        continue;
+      }
+
+      await runOneBotStep(botJob);
     }
-
-    // Process next job if available
-    isProcessingQueue = false;
-    processNextQueueJob();
   } catch (err: any) {
-    isProcessingQueue = false;
     broadcastLog({
-      message: `Error in queue processor: ${err.message || "Unknown error"}`,
+      message: `Error in queue scheduler: ${err.message || "Unknown error"}`,
+      type: "error",
+      timestamp: new Date().toISOString(),
+    });
+  } finally {
+    isProcessingQueue = false;
+  }
+}
+
+// Run a group/channel batch job to completion (unchanged behavior).
+async function runBatchJob(job: any) {
+  await supabase
+    .from("group_creation_queue")
+    .update({ status: "processing", started_at: new Date().toISOString() })
+    .eq("id", job.id);
+
+  const jobType: "group" | "channel" =
+    job.type === "channel" ? "channel" : "group";
+
+  broadcastLog({
+    message: `Starting queued job #${job.id} for account ${job.phone} to create ${job.group_count} ${jobType}s`,
+    type: "info",
+    timestamp: new Date().toISOString(),
+  });
+
+  try {
+    const result = await createGroups(
+      job.phone,
+      job.group_count,
+      job.naming_pattern,
+      job.description,
+      job.messages,
+      jobType,
+      job.workspace || "default"
+    );
+
+    await supabase
+      .from("group_creation_queue")
+      .update({ status: "completed", completed_at: new Date().toISOString() })
+      .eq("id", job.id);
+
+    broadcastLog({
+      message: `Completed queued job #${job.id} for account ${job.phone} — created ${result.successfulGroups}/${result.totalGroups} ${jobType}s`,
+      type: "success",
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    await supabase
+      .from("group_creation_queue")
+      .update({
+        status: "failed",
+        completed_at: new Date().toISOString(),
+        error_message: err.message || "Unknown error",
+      })
+      .eq("id", job.id);
+
+    broadcastLog({
+      message: `Failed queued job #${job.id} for account ${job.phone}: ${
+        err.message || "Unknown error"
+      }`,
       type: "error",
       timestamp: new Date().toISOString(),
     });
   }
 }
 
-// Export function to start queue processor
+// Create ONE bot for a bot job, then update its progress + cooldown. Never throws
+// (all failure modes are turned into a status the scheduler can act on).
+async function runOneBotStep(job: any) {
+  const log = (message: string, type: "info" | "success" | "error" = "info") =>
+    broadcastLog({ message, type, timestamp: new Date().toISOString() });
+
+  const pattern: string = job.naming_pattern || "default";
+  const nowIso = () => new Date().toISOString();
+
+  // First touch: flip pending → processing and announce the job.
+  if (job.status === "pending") {
+    await supabase
+      .from("group_creation_queue")
+      .update({ status: "processing", started_at: new Date().toISOString() })
+      .eq("id", job.id);
+    log(
+      `Starting bot job #${job.id} for account ${job.phone}: ${job.group_count} bot(s), ` +
+        `${
+          pattern === "custom"
+            ? `custom theme "${job.description}"`
+            : `${pattern} pattern`
+        }.`
+    );
+  }
+
+  // Enforce both caps BEFORE any session work (cheap DB check).
+  const { data: limits } = await supabase.rpc("check_bot_limits", {
+    account_phone: job.phone,
+  });
+  if (limits && limits.can_create === false) {
+    if (limits.reason === "total") {
+      await supabase.rpc("set_bots_count", { phone_number: job.phone, new_count: 20 });
+      await supabase
+        .from("group_creation_queue")
+        .update({
+          status: "completed",
+          completed_at: nowIso(),
+          next_attempt_at: null,
+          error_message: `Reached the 20-bot total cap after ${job.bots_done ?? 0} bot(s) this run.`,
+        })
+        .eq("id", job.id);
+      log(`Account ${job.phone} is at the 20-bot cap — job #${job.id} closed.`, "error");
+      return;
+    }
+    if (limits.reason === "daily") {
+      // Park this account until its 24h window resets; other accounts run meanwhile.
+      const resetAt = limits.next_reset
+        ? new Date(limits.next_reset).toISOString()
+        : new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      await supabase
+        .from("group_creation_queue")
+        .update({ next_attempt_at: resetAt, status: "processing" })
+        .eq("id", job.id);
+      log(
+        `Account ${job.phone} hit the 3-per-24h bot limit. Next bot after ${new Date(
+          resetAt
+        ).toLocaleString()}.`
+      );
+      return;
+    }
+  }
+
+  const done = job.bots_done ?? 0;
+  const failures = job.bots_attempts ?? 0;
+  const workspace = job.workspace || "default";
+  const theme = job.description || undefined;
+
+  const res = await createSingleBotForAccount(
+    job.phone,
+    pattern,
+    theme,
+    workspace,
+    log
+  );
+
+  if (res.status === "created") {
+    const newDone = done + 1;
+    if (newDone >= job.group_count) {
+      await supabase
+        .from("group_creation_queue")
+        .update({
+          bots_done: newDone,
+          status: "completed",
+          completed_at: nowIso(),
+          next_attempt_at: null,
+        })
+        .eq("id", job.id);
+      log(
+        `Bot job #${job.id} for ${job.phone} complete — ${newDone}/${job.group_count} bots created.`,
+        "success"
+      );
+    } else {
+      const nextAt = new Date(Date.now() + BOT_COOLDOWN_MS).toISOString();
+      await supabase
+        .from("group_creation_queue")
+        .update({ bots_done: newDone, next_attempt_at: nextAt, status: "processing" })
+        .eq("id", job.id);
+      log(
+        `Bot ${newDone}/${job.group_count} done for ${job.phone}. Next bot for this ` +
+          `account in ~${Math.round(
+            BOT_COOLDOWN_MS / 60000
+          )} min (other accounts run meanwhile).`
+      );
+    }
+    return;
+  }
+
+  if (res.status === "limit") {
+    // Account at Telegram's bot cap — force the counter and close the job.
+    await supabase.rpc("set_bots_count", { phone_number: job.phone, new_count: 20 });
+    await supabase
+      .from("group_creation_queue")
+      .update({
+        status: "completed",
+        completed_at: nowIso(),
+        next_attempt_at: null,
+        error_message: `Reached Telegram's bot cap after ${done} bot(s) this run.`,
+      })
+      .eq("id", job.id);
+    log(
+      `Account ${job.phone} reached the bot cap — job #${job.id} closed after ${done} bot(s).`,
+      "error"
+    );
+    return;
+  }
+
+  // flood / timeout / error / no_username → back off and retry later, up to a cap.
+  const newFailures = failures + 1;
+  if (newFailures >= MAX_BOT_FAILURES) {
+    await supabase
+      .from("group_creation_queue")
+      .update({
+        status: "failed",
+        completed_at: nowIso(),
+        bots_attempts: newFailures,
+        error_message: `Gave up after ${newFailures} failed attempts (last: ${res.status}).`,
+      })
+      .eq("id", job.id);
+    log(
+      `Bot job #${job.id} for ${job.phone} failed after ${newFailures} attempts (${res.status}).`,
+      "error"
+    );
+    return;
+  }
+
+  const backoff = res.status === "flood" ? BOT_FLOOD_BACKOFF_MS : BOT_COOLDOWN_MS;
+  const nextAt = new Date(Date.now() + backoff).toISOString();
+  await supabase
+    .from("group_creation_queue")
+    .update({ bots_attempts: newFailures, next_attempt_at: nextAt, status: "processing" })
+    .eq("id", job.id);
+  log(
+    `Bot attempt for ${job.phone} did not succeed (${res.status}). Retrying in ~${Math.round(
+      backoff / 60000
+    )} min. [${newFailures}/${MAX_BOT_FAILURES} failures]`,
+    "error"
+  );
+}
+
+// Export function to start the queue scheduler
 export function startQueueProcessor() {
   broadcastLog({
-    message: "Starting queue processor...",
+    message: "Starting queue scheduler...",
     type: "info",
     timestamp: new Date().toISOString(),
   });
-  processNextQueueJob();
+  processQueue();
 }
 
 interface CreateGroupsResult {
@@ -669,53 +857,47 @@ async function createGroupsInner(
   }
 }
 
-interface CreateBotsResult {
-  success: boolean;
-  totalBots: number;
-  botsCreated: number;
+interface SingleBotResult {
+  status: "created" | "limit" | "flood" | "timeout" | "error" | "no_username";
+  username?: string;
 }
 
-// Create `botCount` bots for one account via @BotFather, one at a time.
-// Serialized behind the same account lock as group creation so only one account
-// is ever active at once.
-async function createBots(
+// Create exactly ONE bot for an account via @BotFather. Serialized behind the
+// account lock (only one account online at a time). Never throws — every outcome
+// is mapped to a status the scheduler acts on (progress / cooldown / back-off).
+async function createSingleBotForAccount(
   phone: string,
-  botCount: number,
-  useCustomPattern: boolean,
+  pattern: string, // 'default' | 'crypto' | 'custom'
   theme: string | undefined,
-  workspace: string
-): Promise<CreateBotsResult> {
+  workspace: string,
+  log: (message: string, type?: "info" | "success" | "error") => void
+): Promise<SingleBotResult> {
   return withAccountLock(() =>
-    createBotsInner(phone, botCount, useCustomPattern, theme, workspace)
+    createSingleBotInner(phone, pattern, theme, workspace, log)
   );
 }
 
-async function createBotsInner(
+async function createSingleBotInner(
   phone: string,
-  botCount: number,
-  useCustomPattern: boolean,
+  pattern: string,
   theme: string | undefined,
-  workspace: string
-): Promise<CreateBotsResult> {
+  workspace: string,
+  log: (message: string, type?: "info" | "success" | "error") => void
+): Promise<SingleBotResult> {
   let client: any = null;
-  const usernameTheme = useCustomPattern ? theme : undefined;
-
-  // Compact logger used throughout the bot flow (broadcasts to the live console).
-  const log = (message: string, type: "info" | "success" | "error" = "info") =>
-    broadcastLog({ message, type, timestamp: new Date().toISOString() });
+  const mode = pattern === "crypto" ? "crypto" : pattern === "custom" ? "custom" : "default";
+  const usernameTheme = mode === "custom" ? theme : undefined;
 
   try {
     client = await getClientByPhone(phone);
 
-    // Verify the restored session is still usable; recreate once if not.
+    // Verify the restored session; recreate once if stale.
     try {
       const me = await client.getMe();
-      log(
-        `Account ${phone} online as @${me?.username ?? me?.firstName ?? "unknown"} (id ${me?.id}).`
-      );
+      log(`Account ${phone} online as @${me?.username ?? me?.firstName ?? "unknown"}.`);
     } catch (meErr: any) {
       log(
-        `Client validation failed for ${phone} (${meErr?.message || meErr}), recreating session...`,
+        `Session invalid for ${phone} (${meErr?.message || meErr}); recreating...`,
         "error"
       );
       await clearSession(phone);
@@ -723,153 +905,59 @@ async function createBotsInner(
     }
 
     // CRITICAL: sessions restored from a session string do NOT auto-start the
-    // updates loop (that only happens on a fresh sign-in). Without it, BotFather's
-    // replies never reach `waitForResponse` and every step times out. Start it
-    // explicitly here — it's idempotent, and clearSession() tears it down after.
+    // updates loop, so BotFather's replies would never reach waitForResponse.
+    // Start it explicitly (idempotent; clearSession tears it down after).
     try {
       await client.startUpdatesLoop();
-      log(`Updates loop active for ${phone} (required to receive BotFather replies).`);
     } catch (loopErr: any) {
       log(
-        `WARNING: could not start updates loop for ${phone}: ${loopErr?.message || loopErr}. ` +
-          `BotFather replies may not be received.`,
+        `WARNING: could not start updates loop for ${phone}: ${loopErr?.message || loopErr}.`,
         "error"
       );
     }
 
-    log(
-      `Starting creation of ${botCount} bots for account ${phone} ` +
-        `(${useCustomPattern ? `custom theme: "${theme}"` : "default pattern"}).`
-    );
-
-    // Generate a small batch of candidate usernames up front (one AI call).
-    let pool = await generateBotUsernames({ count: botCount, theme: usernameTheme });
-    log(
-      `Generated ${pool.length} candidate username(s): ${pool.slice(0, 10).join(", ")}${
-        pool.length > 10 ? " …" : ""
-      }`
-    );
-    if (pool.length === 0) {
+    // One AI call yields the primary handle plus a few spares (buffer), so a
+    // single /newbot cycle can absorb "username taken" collisions.
+    const candidates = await generateBotUsernames({ count: 1, theme: usernameTheme, mode });
+    if (candidates.length === 0) {
       log(`No usernames generated for ${phone} (check GROQ_API_KEY / Groq status).`, "error");
+      return { status: "error" };
     }
-    const triedAll: string[] = []; // every handle attempted, to avoid on refills
+    const primary = candidates[0];
+    log(
+      `Creating bot "${botDisplayName(primary)}" for ${phone} — trying @${candidates
+        .slice(0, 6)
+        .join(", @")}`
+    );
 
-    let created = 0;
-    let attempts = 0;
-    const maxAttempts = botCount + 8; // safety valve against runaway loops
+    const result = await createBotViaBotFather(
+      client,
+      botDisplayName(primary),
+      candidates.slice(0, 6),
+      log
+    );
 
-    while (created < botCount && attempts < maxAttempts) {
-      attempts++;
-
-      // Refill from the AI if we've exhausted the current pool.
-      if (pool.length === 0) {
-        pool = await generateBotUsernames({
-          count: botCount - created,
-          theme: usernameTheme,
-          avoid: triedAll,
-        });
-        if (pool.length === 0) {
-          broadcastLog({
-            message: `Could not generate any new usernames for ${phone}; stopping.`,
-            type: "error",
-            timestamp: new Date().toISOString(),
-          });
-          break;
-        }
-      }
-
-      // Feed BotFather one primary handle plus a few spares so a single /newbot
-      // cycle can absorb "username taken" collisions without extra AI calls.
-      const primary = pool.shift() as string;
-      const spares = pool.slice(0, 4);
-      const candidates = [primary, ...spares];
-
-      log(
-        `Attempt ${attempts}: creating bot "${botDisplayName(primary)}" — trying @${candidates.join(
-          ", @"
-        )}`
-      );
-
-      const result = await createBotViaBotFather(
-        client,
-        botDisplayName(primary),
-        candidates,
-        log
-      );
-
-      // Drop everything BotFather tried from the pool and remember it.
-      for (const t of result.tried) {
-        triedAll.push(t);
-        const idx = pool.indexOf(t);
-        if (idx !== -1) pool.splice(idx, 1);
-      }
-
-      if (result.ok) {
-        // BotFather is asked for the display name up front (from the primary
-        // candidate) before a username is chosen, so store that exact name.
-        await supabase.from("telegram_bots").insert({
-          workspace,
-          owner_phone: phone,
-          username: result.username,
-          display_name: botDisplayName(primary),
-          token: result.token,
-          theme: useCustomPattern ? theme || null : null,
-        });
-        await supabase.rpc("increment_bots_count", {
-          phone_number: phone,
-          increment_amount: 1,
-        });
-        created++;
-
-        // Log the handle only — never the raw token (the WS log is global).
-        broadcastLog({
-          message: `Created bot @${result.username} for account ${phone} (${created}/${botCount})`,
-          type: "success",
-          timestamp: new Date().toISOString(),
-        });
-      } else if (result.reason === "limit") {
-        // Account already at Telegram's 20-bot cap (possibly from earlier bots).
-        // Force the counter to the cap so the UI reflects it and we skip ahead.
-        broadcastLog({
-          message: `Account ${phone} has reached Telegram's 20-bot limit. Marking as full and skipping.`,
-          type: "error",
-          timestamp: new Date().toISOString(),
-        });
-        await supabase.rpc("set_bots_count", {
-          phone_number: phone,
-          new_count: 20,
-        });
-        break;
-      } else if (result.reason === "flood") {
-        log(
-          `BotFather rate-limited account ${phone} (${result.message}). Stopping this account.`,
-          "error"
-        );
-        break;
-      } else if (result.reason === "timeout") {
-        // Updates never arrived — retrying more usernames won't help this run.
-        log(
-          `BotFather did not respond for ${phone} (timeout). Stopping this account. ` +
-            `If this persists, the updates loop isn't delivering messages.`,
-          "error"
-        );
-        break;
-      } else if (result.reason === "error") {
-        log(`BotFather error for ${phone}: ${result.message}. Stopping this account.`, "error");
-        break;
-      } else {
-        // no_username: all candidates in this cycle were rejected — loop will
-        // refill and try fresh names on the next iteration.
-        log(`No available username found this round for ${phone}; retrying with new names.`);
-      }
-
-      // Human-like gap between bots.
-      if (created < botCount) {
-        await new Promise((resolve) => setTimeout(resolve, 4000));
-      }
+    if (result.ok) {
+      // Store what BotFather actually set as the name (from the primary handle).
+      await supabase.from("telegram_bots").insert({
+        workspace,
+        owner_phone: phone,
+        username: result.username,
+        display_name: botDisplayName(primary),
+        token: result.token,
+        theme: mode === "custom" ? theme || null : mode === "crypto" ? "crypto" : null,
+      });
+      // Bumps both the total counter and the 3-per-24h daily counter atomically.
+      await supabase.rpc("register_bot_creation", { account_phone: phone });
+      // Log the handle only — never the raw token (the WS log is global).
+      log(`Created bot @${result.username} for account ${phone}.`, "success");
+      return { status: "created", username: result.username };
     }
 
-    return { success: true, totalBots: botCount, botsCreated: created };
+    return { status: result.reason };
+  } catch (err: any) {
+    log(`Unexpected error creating bot for ${phone}: ${err?.message || err}`, "error");
+    return { status: "error" };
   } finally {
     if (client) {
       try {
@@ -1021,7 +1109,7 @@ router.get("/accounts", async (req: Request, res: Response) => {
     const { data, error } = await supabase
       .from("telegram_accounts")
       .select(
-        "phone, username, groups_count, channels_count, groups_created_24h, next_available_time, flood_wait_until"
+        "phone, username, groups_count, channels_count, bots_count, bots_created_24h, groups_created_24h, next_available_time, flood_wait_until"
       )
       .eq("workspace", ws)
       .order("phone", { ascending: true });
@@ -1050,6 +1138,8 @@ router.get("/accounts", async (req: Request, res: Response) => {
                 username: account.username,
                 groups_count: account.groups_count || 0,
                 channels_count: account.channels_count || 0,
+                bots_count: account.bots_count || 0,
+                bots_created_24h: account.bots_created_24h || 0,
                 groups_created_24h: account.groups_created_24h || 0,
                 next_available_time: effectiveAvailableTime,
                 rateLimitInfo: null,
@@ -1060,6 +1150,8 @@ router.get("/accounts", async (req: Request, res: Response) => {
               username: account.username,
               groups_count: account.groups_count || 0,
               channels_count: account.channels_count || 0,
+              bots_count: account.bots_count || 0,
+              bots_created_24h: account.bots_created_24h || 0,
               groups_created_24h:
                 (rateLimitInfo.groups_created_24h ??
                   account.groups_created_24h) ||
@@ -1291,10 +1383,14 @@ router.post(
   }
 );
 
-// POST /bots/create - create N bots for one account via BotFather (synchronous)
+// POST /bots/create - enqueue a bot job for one account. Bots are created by the
+// backend scheduler (round-robin across accounts, per-account cooldown + 3/24h
+// daily cap), so this returns immediately with a job id; watch the queue.
 router.post("/bots/create", async (req: Request, res: Response) => {
   const ws = getWorkspace(req);
-  const { phone, botCount, useCustomPattern, theme } = req.body;
+  const { phone, botCount, pattern, theme } = req.body;
+  const namingPattern: "default" | "crypto" | "custom" =
+    pattern === "crypto" ? "crypto" : pattern === "custom" ? "custom" : "default";
 
   if (!phone || typeof phone !== "string") {
     return res.status(400).json({ error: "Missing or invalid phone" });
@@ -1303,7 +1399,7 @@ router.post("/bots/create", async (req: Request, res: Response) => {
   if (!count || count < 1 || count > 20) {
     return res.status(400).json({ error: "botCount must be between 1 and 20" });
   }
-  if (useCustomPattern && (!theme || typeof theme !== "string")) {
+  if (namingPattern === "custom" && (!theme || typeof theme !== "string")) {
     return res
       .status(400)
       .json({ error: "A theme is required when using a custom pattern" });
@@ -1321,27 +1417,32 @@ router.post("/bots/create", async (req: Request, res: Response) => {
       return res.status(404).json({ success: false, error: "Account not found" });
     }
 
-    const result = await createBots(
-      phone,
-      count,
-      !!useCustomPattern,
-      theme,
-      ws
-    );
+    const { data: job, error: jobError } = await supabase
+      .from("group_creation_queue")
+      .insert({
+        phone,
+        workspace: ws,
+        group_count: count,
+        naming_pattern: namingPattern,
+        description: theme || "",
+        type: "bot",
+        status: "pending",
+        created_at: new Date().toISOString(),
+      })
+      .select()
+      .single();
 
-    return res.json({
-      success: true,
-      data: {
-        botsCreated: result.botsCreated,
-        totalBots: result.totalBots,
-      },
-    });
+    if (jobError) {
+      return res.status(500).json({
+        success: false,
+        error: `Failed to enqueue bot job: ${jobError.message}`,
+      });
+    }
+
+    processQueue();
+
+    return res.json({ success: true, data: { job_id: job.id } });
   } catch (err: any) {
-    broadcastLog({
-      message: `Unexpected error creating bots: ${err.message}`,
-      type: "error",
-      timestamp: new Date().toISOString(),
-    });
     return res.status(500).json({
       success: false,
       error: err.message || "An unexpected error occurred",

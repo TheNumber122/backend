@@ -6,10 +6,13 @@
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "llama-3.3-70b-versatile";
 
+type GenMode = "default" | "crypto" | "custom";
+
 interface GenerateOpts {
   count: number;
   theme?: string; // custom-pattern theme, e.g. "must be about crypto"
   avoid?: string[]; // handles already tried this run (skip duplicates)
+  mode?: GenMode; // 'crypto' forces start-with-"crypto", end-with bot/robot
 }
 
 // How many extra candidates to request beyond `count`, so a few "username taken"
@@ -21,12 +24,14 @@ function capitalizeFirst(s: string): string {
 }
 
 // Turn any model output into a clean, rule-compliant handle or null if unusable.
-function sanitize(raw: unknown): string | null {
+// crypto mode: must start with "crypto" and end with "bot" or "robot".
+function sanitize(raw: unknown, mode: GenMode = "default"): string | null {
   if (typeof raw !== "string") return null;
   let u = raw.toLowerCase().replace(/[^a-z]/g, ""); // letters only, drops @, digits, _
   if (!u) return null;
-  if (!u.endsWith("bot")) u = u + "bot";
-  if (u.length < 6 || u.length > 20) return null;
+  if (mode === "crypto" && !u.startsWith("crypto")) u = "crypto" + u;
+  if (!u.endsWith("bot")) u = u + "bot"; // "robot" also ends with "bot"
+  if (u.length < 6 || u.length > 24) return null;
   return u;
 }
 
@@ -36,7 +41,11 @@ export function botDisplayName(username: string): string {
 
 // Local fallback: consonant-vowel syllables + "bot". Deterministic-ish variety
 // without external calls. Not as creative as the LLM but always available.
-export function localBotUsernames(count: number, avoid: string[] = []): string[] {
+export function localBotUsernames(
+  count: number,
+  avoid: string[] = [],
+  mode: GenMode = "default"
+): string[] {
   const cons = "bcdfgklmnprstvz".split("");
   const vowels = "aeiou".split("");
   const seen = new Set(avoid);
@@ -53,7 +62,9 @@ export function localBotUsernames(count: number, avoid: string[] = []): string[]
         word += cons[(guard * 11 + i) % cons.length];
       }
     }
-    const handle = sanitize(word);
+    // crypto mode: prefix "crypto" and vary the bot/robot suffix for variety.
+    if (mode === "crypto") word = "crypto" + word + (guard % 2 ? "ro" : "");
+    const handle = sanitize(word, mode);
     if (handle && !seen.has(handle)) {
       seen.add(handle);
       out.push(handle);
@@ -63,31 +74,46 @@ export function localBotUsernames(count: number, avoid: string[] = []): string[]
 }
 
 export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]> {
-  const { count, theme, avoid = [] } = opts;
+  const { count, theme, avoid = [], mode = "default" } = opts;
   const want = count + BUFFER;
   const key = process.env.GROQ_API_KEY;
 
   if (!key) {
-    return localBotUsernames(want, avoid);
+    return localBotUsernames(want, avoid, mode);
   }
 
-  const themeLine = theme
-    ? `The names should subtly evoke this theme: "${theme}". Keep them brandable, not literal.`
-    : "";
+  const themeLine =
+    mode === "custom" && theme
+      ? `The names should subtly evoke this theme: "${theme}". Keep them brandable, not literal.`
+      : "";
   const avoidLine = avoid.length
     ? `Do NOT output any of these already-used names: ${avoid.join(", ")}.`
     : "";
 
+  const rules =
+    mode === "crypto"
+      ? [
+          "- lowercase English letters a-z ONLY",
+          '- MUST start with "crypto" and MUST end with "bot" or "robot"',
+          "- NO numbers, NO underscores, NO spaces, NO symbols",
+          "- 9 to 24 characters long",
+          "- the middle is a short pronounceable invented segment",
+          'Good examples: cryptovexbot, cryptonovarobot, cryptozelbot, cryptolumbot.',
+        ]
+      : [
+          "- lowercase English letters a-z ONLY",
+          '- MUST end with the letters "bot"',
+          "- NO numbers, NO underscores, NO spaces, NO symbols",
+          "- 6 to 20 characters long",
+          "- pronounceable, brandable, invented words (not real dictionary words)",
+          "- avoid common/obvious names likely already registered on Telegram",
+          "Good examples: cariovobot, nasionobot, unibopbot, rezotinrobot.",
+        ];
+
   const userPrompt = [
     `Generate ${want} unique Telegram bot usernames.`,
     "Strict rules:",
-    "- lowercase English letters a-z ONLY",
-    "- MUST end with the letters \"bot\"",
-    "- NO numbers, NO underscores, NO spaces, NO symbols",
-    "- 6 to 20 characters long",
-    "- pronounceable, brandable, invented words (not real dictionary words)",
-    "- avoid common/obvious names likely already registered on Telegram",
-    "Good examples: cariovobot, nasionobot, unibopbot, rezotinrobot.",
+    ...rules,
     themeLine,
     avoidLine,
     'Respond ONLY as JSON: {"usernames": ["...", "..."]}',
@@ -133,7 +159,7 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
     const seen = new Set(avoid);
     const cleaned: string[] = [];
     for (const item of list) {
-      const handle = sanitize(item);
+      const handle = sanitize(item, mode);
       if (handle && !seen.has(handle)) {
         seen.add(handle);
         cleaned.push(handle);
@@ -142,11 +168,11 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
 
     // If the model under-delivered, top up locally so callers always get enough.
     if (cleaned.length < count) {
-      cleaned.push(...localBotUsernames(want - cleaned.length, [...seen]));
+      cleaned.push(...localBotUsernames(want - cleaned.length, [...seen], mode));
     }
     return cleaned;
   } catch {
     // Any failure → local fallback, so the feature stays functional.
-    return localBotUsernames(want, avoid);
+    return localBotUsernames(want, avoid, mode);
   }
 }
