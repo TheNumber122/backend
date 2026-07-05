@@ -394,7 +394,8 @@ export async function sendLoginCode(phone: string): Promise<void> {
 export async function verifyLoginCode(
   phone: string,
   code: string,
-  password?: string
+  password?: string,
+  workspace: string = "default"
 ) {
   // Reuse the pending client from send-code without validating it — the
   // account isn't authorized yet, so a getMe() check would destroy the session
@@ -414,6 +415,7 @@ export async function verifyLoginCode(
       session_string: sessionString,
       groups_count: 0, // Initialize groups count for new accounts
       username,
+      workspace, // Tag the account so it only shows up for its owner
     });
     // Session is safely persisted to the DB — kill the in-memory client so we
     // don't stay connected (and so its updates loop stops). It'll be re-imported

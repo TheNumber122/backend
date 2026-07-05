@@ -11,6 +11,7 @@ import {
 } from "./telegram/manager";
 import { supabase, protectedDb } from "./db/supabase";
 import { broadcastLog } from "./broadcast";
+import { getWorkspace } from "./workspace";
 
 // Queue processor
 let isProcessingQueue = false;
@@ -25,15 +26,17 @@ router.get("/", (_req: Request, res: Response) => {
 // Set all accounts available now
 router.post(
   "/accounts/set-all-available",
-  async (_req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     try {
+      const ws = getWorkspace(req);
       const now = new Date().toISOString();
       // Clear both block sources: expire the 24h window (next_available_time in
       // the past forces a counter reset) and drop any active flood wait. Match
-      // rows blocked by either column.
+      // rows blocked by either column, scoped to the caller's workspace.
       const { data, error } = await supabase
         .from("telegram_accounts")
         .update({ next_available_time: now, flood_wait_until: null })
+        .eq("workspace", ws)
         .or("next_available_time.not.is.null,flood_wait_until.not.is.null");
 
       if (error) throw error;
@@ -47,6 +50,7 @@ router.post(
 // Queue routes
 router.post("/queue/add", async (req: Request, res: Response) => {
   try {
+    const ws = getWorkspace(req);
     const { phone, group_count, naming_pattern, description, messages, type } =
       req.body;
 
@@ -67,11 +71,13 @@ router.post("/queue/add", async (req: Request, res: Response) => {
       });
     }
 
-    // Validate phone exists
+    // Validate phone exists AND belongs to the caller's workspace, so one user
+    // can't queue jobs against another user's account.
     const { data: account, error: accountError } = await supabase
       .from("telegram_accounts")
       .select("phone")
       .eq("phone", phone)
+      .eq("workspace", ws)
       .single();
 
     if (accountError || !account) {
@@ -84,6 +90,7 @@ router.post("/queue/add", async (req: Request, res: Response) => {
     // Base row shared by both group and channel jobs.
     const baseRow = {
       phone,
+      workspace: ws,
       group_count: count,
       naming_pattern,
       description: description || "",
@@ -148,11 +155,13 @@ router.post("/queue/add", async (req: Request, res: Response) => {
   }
 });
 
-router.get("/queue", async (_req: Request, res: Response) => {
+router.get("/queue", async (req: Request, res: Response) => {
   try {
+    const ws = getWorkspace(req);
     const { data: jobs, error } = await supabase
       .from("group_creation_queue")
       .select("*")
+      .eq("workspace", ws)
       .order("created_at", { ascending: false });
 
     if (error) {
@@ -176,12 +185,14 @@ router.get("/queue", async (_req: Request, res: Response) => {
 
 router.delete("/queue/:id", async (req: Request, res: Response) => {
   try {
+    const ws = getWorkspace(req);
     const { id } = req.params;
 
     const { error } = await supabase
       .from("group_creation_queue")
       .delete()
-      .eq("id", id);
+      .eq("id", id)
+      .eq("workspace", ws);
 
     if (error) {
       return res.status(500).json({
@@ -757,13 +768,15 @@ async function sendMessagesToGroup(
 }
 
 // GET /accounts - Get all accounts
-router.get("/accounts", async (_req: Request, res: Response) => {
+router.get("/accounts", async (req: Request, res: Response) => {
   try {
+    const ws = getWorkspace(req);
     const { data, error } = await supabase
       .from("telegram_accounts")
       .select(
         "phone, username, groups_count, channels_count, groups_created_24h, next_available_time, flood_wait_until"
       )
+      .eq("workspace", ws)
       .order("phone", { ascending: true });
 
     if (error) {
@@ -823,6 +836,7 @@ router.get("/accounts", async (_req: Request, res: Response) => {
 
 // DELETE /accounts/:phone - Delete an account
 router.delete("/accounts/:phone", async (req: Request, res: Response) => {
+  const ws = getWorkspace(req);
   const { phone } = req.params;
   if (!phone) {
     return res.status(400).json({ error: "Missing phone parameter" });
@@ -832,7 +846,8 @@ router.delete("/accounts/:phone", async (req: Request, res: Response) => {
     const { error } = await supabase
       .from("telegram_accounts")
       .delete()
-      .eq("phone", phone);
+      .eq("phone", phone)
+      .eq("workspace", ws);
 
     if (error) {
       return res.status(500).json({ error: "Failed to delete account" });
@@ -860,6 +875,7 @@ router.post("/login/send-code", async (req: Request, res: Response) => {
 
 // POST /login/verify
 router.post("/login/verify", async (req: Request, res: Response) => {
+  const ws = getWorkspace(req);
   const { phone, code, password } = req.body;
   if (
     !phone ||
@@ -870,7 +886,7 @@ router.post("/login/verify", async (req: Request, res: Response) => {
     return res.status(400).json({ error: "Missing or invalid phone/code" });
   }
   try {
-    const user = await verifyLoginCode(phone, code, password);
+    const user = await verifyLoginCode(phone, code, password, ws);
     res.json({ success: true, user });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to verify code" });
@@ -890,6 +906,7 @@ router.post("/groups/create", async (req: Request, res: Response) => {
   } = req.body;
 
   const entityType = type === "channel" ? "channel" : "group";
+  const ws = getWorkspace(req);
 
   // Validate input
   if (!phone || typeof phone !== "string") {
@@ -917,6 +934,17 @@ router.post("/groups/create", async (req: Request, res: Response) => {
   }
 
   try {
+    // Ensure the account belongs to the caller's workspace before doing any work.
+    const { data: owned } = await supabase
+      .from("telegram_accounts")
+      .select("phone")
+      .eq("phone", phone)
+      .eq("workspace", ws)
+      .single();
+    if (!owned) {
+      return res.status(404).json({ success: false, error: "Account not found" });
+    }
+
     const result = await createGroups(
       phone,
       count,
@@ -957,6 +985,7 @@ router.post("/groups/create", async (req: Request, res: Response) => {
 router.post(
   "/accounts/update-rate-limit",
   async (req: Request, res: Response) => {
+    const ws = getWorkspace(req);
     const { phone, wait_seconds } = req.body;
 
     if (!phone || typeof phone !== "string") {
@@ -984,7 +1013,8 @@ router.post(
         .update({
           flood_wait_until: floodWaitUntil.toISOString(),
         })
-        .eq("phone", phone);
+        .eq("phone", phone)
+        .eq("workspace", ws);
 
       if (updateError) {
         console.error("Failed to update account rate limit:", updateError);

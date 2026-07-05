@@ -7,7 +7,10 @@ create table if not exists telegram_accounts (
   groups_created_24h integer not null default 0,
   next_available_time timestamptz,
   flood_wait_until timestamptz,
-  session_string text
+  session_string text,
+  -- Owner tag: isolates one user's accounts from another's. Pre-existing rows
+  -- default to 'default'. See backend/src/workspace.ts.
+  workspace text not null default 'default'
 );
 
 -- Enable RLS
@@ -184,6 +187,16 @@ begin
   ) then
     alter table telegram_accounts add column flood_wait_until timestamptz;
   end if;
+
+  -- Workspace/owner tag for multi-user isolation. Existing accounts default to
+  -- 'default'; new logins are tagged with the caller's workspace.
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'telegram_accounts'
+    and column_name = 'workspace'
+  ) then
+    alter table telegram_accounts add column workspace text not null default 'default';
+  end if;
 end $$;
 
 -- Add migration for first_creation_time if it exists
@@ -233,7 +246,9 @@ create table if not exists group_creation_queue (
   created_at timestamptz not null default now(),
   started_at timestamptz,
   completed_at timestamptz,
-  error_message text
+  error_message text,
+  -- Owner tag, mirrors telegram_accounts.workspace. See backend/src/workspace.ts.
+  workspace text not null default 'default'
 );
 
 -- Add type column to group_creation_queue if it doesn't exist (safe to re-run).
@@ -246,6 +261,15 @@ begin
     and column_name = 'type'
   ) then
     alter table group_creation_queue add column type text not null default 'group';
+  end if;
+
+  -- Workspace/owner tag for multi-user isolation (safe to re-run).
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'group_creation_queue'
+    and column_name = 'workspace'
+  ) then
+    alter table group_creation_queue add column workspace text not null default 'default';
   end if;
 end $$;
 
