@@ -15,6 +15,12 @@ import { getWorkspace } from "./workspace";
 import { generateBotUsernames, botDisplayName } from "./ai/groq";
 import { createBotViaBotFather } from "./telegram/botfather";
 
+// Only channels created by accounts in THIS workspace get recorded into the
+// sister project's protected_channels table (so its auto-leave bot skips them).
+// Friends' channels are never recorded. Override via env if the name changes.
+const PROTECTED_CHANNELS_WORKSPACE =
+  process.env.PROTECTED_CHANNELS_WORKSPACE || "me";
+
 // Queue processor
 let isProcessingQueue = false;
 
@@ -277,7 +283,8 @@ async function processNextQueueJob() {
           job.naming_pattern,
           job.description,
           job.messages,
-          jobType
+          jobType,
+          job.workspace || "default"
         );
         completedMsg = `Completed queued job #${job.id} for account ${job.phone} — created ${result.successfulGroups}/${result.totalGroups} ${jobType}s`;
       }
@@ -351,7 +358,8 @@ async function createGroups(
   namingPattern: string,
   description?: string,
   messages?: any[],
-  type: "group" | "channel" = "group"
+  type: "group" | "channel" = "group",
+  workspace: string = "default"
 ): Promise<CreateGroupsResult> {
   // Serialize: only one account may be active at a time.
   return withAccountLock(() =>
@@ -361,7 +369,8 @@ async function createGroups(
       namingPattern,
       description,
       messages,
-      type
+      type,
+      workspace
     )
   );
 }
@@ -372,7 +381,8 @@ async function createGroupsInner(
   namingPattern: string,
   description?: string,
   messages?: any[],
-  type: "group" | "channel" = "group"
+  type: "group" | "channel" = "group",
+  workspace: string = "default"
 ): Promise<CreateGroupsResult> {
   const entity = type === "channel" ? "channel" : "group";
   let client: any = null;
@@ -466,9 +476,11 @@ async function createGroupsInner(
             timestamp: new Date().toISOString(),
           });
 
-          // Protect broadcast channels from the external auto-leave bot.
-          // (Megagroups are already skipped by the bot's megagroup !== true filter.)
-          if (type === "channel") {
+          // Protect broadcast channels from the external auto-leave bot, but
+          // ONLY for my own workspace — friends' channels aren't recorded into
+          // the sister project. (Megagroups are already skipped by the bot's
+          // megagroup !== true filter.)
+          if (type === "channel" && workspace === PROTECTED_CHANNELS_WORKSPACE) {
             await recordProtectedChannel(phone, chat.id, title);
           }
 
@@ -688,30 +700,58 @@ async function createBotsInner(
   let client: any = null;
   const usernameTheme = useCustomPattern ? theme : undefined;
 
+  // Compact logger used throughout the bot flow (broadcasts to the live console).
+  const log = (message: string, type: "info" | "success" | "error" = "info") =>
+    broadcastLog({ message, type, timestamp: new Date().toISOString() });
+
   try {
     client = await getClientByPhone(phone);
 
     // Verify the restored session is still usable; recreate once if not.
     try {
-      await client.getMe();
-    } catch {
-      broadcastLog({
-        message: `Client validation failed for ${phone}, recreating session...`,
-        type: "error",
-        timestamp: new Date().toISOString(),
-      });
+      const me = await client.getMe();
+      log(
+        `Account ${phone} online as @${me?.username ?? me?.firstName ?? "unknown"} (id ${me?.id}).`
+      );
+    } catch (meErr: any) {
+      log(
+        `Client validation failed for ${phone} (${meErr?.message || meErr}), recreating session...`,
+        "error"
+      );
       await clearSession(phone);
       client = await getClientByPhone(phone);
     }
 
-    broadcastLog({
-      message: `Starting creation of ${botCount} bots for account ${phone}`,
-      type: "info",
-      timestamp: new Date().toISOString(),
-    });
+    // CRITICAL: sessions restored from a session string do NOT auto-start the
+    // updates loop (that only happens on a fresh sign-in). Without it, BotFather's
+    // replies never reach `waitForResponse` and every step times out. Start it
+    // explicitly here — it's idempotent, and clearSession() tears it down after.
+    try {
+      await client.startUpdatesLoop();
+      log(`Updates loop active for ${phone} (required to receive BotFather replies).`);
+    } catch (loopErr: any) {
+      log(
+        `WARNING: could not start updates loop for ${phone}: ${loopErr?.message || loopErr}. ` +
+          `BotFather replies may not be received.`,
+        "error"
+      );
+    }
+
+    log(
+      `Starting creation of ${botCount} bots for account ${phone} ` +
+        `(${useCustomPattern ? `custom theme: "${theme}"` : "default pattern"}).`
+    );
 
     // Generate a small batch of candidate usernames up front (one AI call).
     let pool = await generateBotUsernames({ count: botCount, theme: usernameTheme });
+    log(
+      `Generated ${pool.length} candidate username(s): ${pool.slice(0, 10).join(", ")}${
+        pool.length > 10 ? " …" : ""
+      }`
+    );
+    if (pool.length === 0) {
+      log(`No usernames generated for ${phone} (check GROQ_API_KEY / Groq status).`, "error");
+    }
     const triedAll: string[] = []; // every handle attempted, to avoid on refills
 
     let created = 0;
@@ -744,10 +784,17 @@ async function createBotsInner(
       const spares = pool.slice(0, 4);
       const candidates = [primary, ...spares];
 
+      log(
+        `Attempt ${attempts}: creating bot "${botDisplayName(primary)}" — trying @${candidates.join(
+          ", @"
+        )}`
+      );
+
       const result = await createBotViaBotFather(
         client,
         botDisplayName(primary),
-        candidates
+        candidates,
+        log
       );
 
       // Drop everything BotFather tried from the pool and remember it.
@@ -794,20 +841,26 @@ async function createBotsInner(
         });
         break;
       } else if (result.reason === "flood") {
-        broadcastLog({
-          message: `BotFather rate-limited account ${phone} (${result.message}). Stopping this account.`,
-          type: "error",
-          timestamp: new Date().toISOString(),
-        });
+        log(
+          `BotFather rate-limited account ${phone} (${result.message}). Stopping this account.`,
+          "error"
+        );
+        break;
+      } else if (result.reason === "timeout") {
+        // Updates never arrived — retrying more usernames won't help this run.
+        log(
+          `BotFather did not respond for ${phone} (timeout). Stopping this account. ` +
+            `If this persists, the updates loop isn't delivering messages.`,
+          "error"
+        );
+        break;
+      } else if (result.reason === "error") {
+        log(`BotFather error for ${phone}: ${result.message}. Stopping this account.`, "error");
         break;
       } else {
         // no_username: all candidates in this cycle were rejected — loop will
         // refill and try fresh names on the next iteration.
-        broadcastLog({
-          message: `No available username found this round for ${phone}; retrying with new names.`,
-          type: "info",
-          timestamp: new Date().toISOString(),
-        });
+        log(`No available username found this round for ${phone}; retrying with new names.`);
       }
 
       // Human-like gap between bots.
@@ -1145,7 +1198,8 @@ router.post("/groups/create", async (req: Request, res: Response) => {
       namingPattern,
       description,
       messages,
-      entityType
+      entityType,
+      ws
     );
 
     // Get updated rate limit info
