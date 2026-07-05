@@ -6,9 +6,16 @@
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "llama-3.3-70b-versatile";
 
-// How many times to re-ask Groq if a batch comes back short or a transient
-// error hits, before giving up and padding with what we have.
-const MAX_ROUNDS = 3;
+// Messages are generated in batches: one Groq call reliably returns ~25 good
+// messages, so for large pools (up to 200) we loop, accumulating until we reach
+// the target. Keeps each response high-quality instead of asking for 200 at once.
+const BATCH = 25;
+// Stop early if this many consecutive rounds add nothing new (theme exhausted).
+const MAX_DRY_ROUNDS = 4;
+// Only show the model the most recent messages as "don't repeat these" so the
+// prompt stays bounded even when the pool is large (we still dedupe them all
+// locally against the full set).
+const AVOID_WINDOW = 40;
 
 function clean(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
@@ -101,20 +108,35 @@ export async function generateBroadcastMessages(
   if (!key) throw new Error("GROQ_API_KEY is not configured.");
   if (count < 1) return [];
 
-  const seen: string[] = [];
+  const seenSet = new Set<string>();
   const out: string[] = [];
+  let dry = 0;
 
-  for (let round = 0; round < MAX_ROUNDS && out.length < count; round++) {
-    const want = count - out.length;
+  // Enough rounds to cover the target in BATCH-sized chunks, with headroom for
+  // duplicate/short responses — but bounded so it can never spin forever.
+  const maxRounds = Math.ceil(count / BATCH) * 3 + 4;
+
+  for (
+    let round = 0;
+    round < maxRounds && out.length < count && dry < MAX_DRY_ROUNDS;
+    round++
+  ) {
+    const want = Math.min(BATCH, count - out.length);
+    const avoid = out.slice(-AVOID_WINDOW); // only the recent tail, prompt stays small
+    let added = 0;
     try {
-      const batch = await callGroqOnce(key, want, theme, seen);
+      const batch = await callGroqOnce(key, want, theme, avoid);
       for (const m of batch) {
-        seen.push(m);
-        out.push(m);
+        if (!seenSet.has(m)) {
+          seenSet.add(m);
+          out.push(m);
+          added++;
+        }
       }
     } catch {
       // transient — try another round
     }
+    dry = added === 0 ? dry + 1 : 0;
   }
 
   if (out.length === 0) {

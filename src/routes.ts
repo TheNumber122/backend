@@ -1882,7 +1882,7 @@ function asArray(v: any): any[] {
 router.post("/messaging/messages/preview", async (req: Request, res: Response) => {
   try {
     const { theme } = req.body;
-    const count = Math.max(1, Math.min(30, Number(req.body.count) || 1));
+    const count = Math.max(1, Math.min(200, Number(req.body.count) || 1));
     if (!theme || typeof theme !== "string") {
       return res.status(400).json({ success: false, error: "A theme is required." });
     }
@@ -1959,7 +1959,7 @@ router.post("/messaging/jobs", async (req: Request, res: Response) => {
       };
     } else {
       // drip
-      const total = Math.max(1, Math.min(30, Number(body.messagesPerChat) || 1));
+      const total = Math.max(1, Math.min(200, Number(body.messagesPerChat) || 1));
       const spanDays = Math.max(0.001, Math.min(60, Number(body.spanDays) || 1));
       const theme = typeof body.theme === "string" ? body.theme.trim() : "";
       const edited = asArray(body.messages).filter((m) => typeof m === "string" && m.trim());
