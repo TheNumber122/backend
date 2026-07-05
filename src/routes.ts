@@ -176,10 +176,12 @@ router.post("/queue/add", async (req: Request, res: Response) => {
   }
 });
 
-router.get("/queue", async (_req: Request, res: Response) => {
+router.get("/queue", async (req: Request, res: Response) => {
   try {
     // Shared dashboard: the console log is global, so the queue is shown to all
-    // users too (both workspaces see every job). Creation stays workspace-scoped.
+    // users too (both workspaces see every job). Creation and cancellation stay
+    // workspace-scoped; `is_owner` tells the UI which jobs the caller may cancel.
+    const ws = getWorkspace(req);
     const { data: jobs, error } = await supabase
       .from("group_creation_queue")
       .select("*")
@@ -192,9 +194,14 @@ router.get("/queue", async (_req: Request, res: Response) => {
       });
     }
 
+    const withOwner = (jobs || []).map((j: any) => ({
+      ...j,
+      is_owner: (j.workspace || "default") === ws,
+    }));
+
     return res.json({
       success: true,
-      jobs,
+      jobs: withOwner,
     });
   } catch (err: any) {
     return res.status(500).json({
@@ -206,9 +213,24 @@ router.get("/queue", async (_req: Request, res: Response) => {
 
 router.delete("/queue/:id", async (req: Request, res: Response) => {
   try {
+    const ws = getWorkspace(req);
     const { id } = req.params;
 
-    // Shared dashboard: any user can remove any job from the common queue view.
+    // Everyone can SEE every job, but only the owner (who queued it) may cancel.
+    const { data: job } = await supabase
+      .from("group_creation_queue")
+      .select("workspace")
+      .eq("id", id)
+      .single();
+    if (!job) {
+      return res.status(404).json({ success: false, error: "Job not found" });
+    }
+    if ((job.workspace || "default") !== ws) {
+      return res
+        .status(403)
+        .json({ success: false, error: "Only the owner can cancel this job." });
+    }
+
     const { error } = await supabase
       .from("group_creation_queue")
       .delete()
@@ -2020,9 +2042,11 @@ router.post("/messaging/jobs", async (req: Request, res: Response) => {
 });
 
 // GET /messaging/jobs — list jobs with per-account progress. Shared across users
-// (like the console log), so both workspaces see every messaging job.
-router.get("/messaging/jobs", async (_req: Request, res: Response) => {
+// (like the console log), so both workspaces see every messaging job. `is_owner`
+// tells the UI which jobs the caller may cancel.
+router.get("/messaging/jobs", async (req: Request, res: Response) => {
   try {
+    const ws = getWorkspace(req);
     const { data: jobs, error } = await supabase
       .from("messaging_jobs")
       .select("*, targets:messaging_targets(*)")
@@ -2030,7 +2054,11 @@ router.get("/messaging/jobs", async (_req: Request, res: Response) => {
     if (error) {
       return res.status(500).json({ success: false, error: `Failed to list jobs: ${error.message}` });
     }
-    return res.json({ success: true, data: jobs || [] });
+    const withOwner = (jobs || []).map((j: any) => ({
+      ...j,
+      is_owner: (j.workspace || "default") === ws,
+    }));
+    return res.json({ success: true, data: withOwner });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err?.message || "Unexpected error." });
   }
@@ -2039,8 +2067,9 @@ router.get("/messaging/jobs", async (_req: Request, res: Response) => {
 // DELETE /messaging/jobs/:id — cancel a job (scheduler skips non-active jobs).
 router.delete("/messaging/jobs/:id", async (req: Request, res: Response) => {
   try {
+    const ws = getWorkspace(req);
     const { id } = req.params;
-    // Shared dashboard: any user can cancel any messaging job from the common view.
+    // Everyone can SEE every job, but only the owner may cancel it.
     const { data: job } = await supabase
       .from("messaging_jobs")
       .select("*")
@@ -2048,6 +2077,11 @@ router.delete("/messaging/jobs/:id", async (req: Request, res: Response) => {
       .single();
     if (!job) {
       return res.status(404).json({ success: false, error: "Job not found." });
+    }
+    if ((job.workspace || "default") !== ws) {
+      return res
+        .status(403)
+        .json({ success: false, error: "Only the owner can cancel this job." });
     }
     await supabase
       .from("messaging_jobs")
