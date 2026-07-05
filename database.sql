@@ -10,7 +10,10 @@ create table if not exists telegram_accounts (
   session_string text,
   -- Owner tag: isolates one user's accounts from another's. Pre-existing rows
   -- default to 'default'. See backend/src/workspace.ts.
-  workspace text not null default 'default'
+  workspace text not null default 'default',
+  -- Bots created via BotFather for this account. Telegram caps this at 20 per
+  -- account; we force it to 20 when BotFather reports the cap (see routes.ts).
+  bots_count integer not null default 0
 );
 
 -- Enable RLS
@@ -197,7 +200,41 @@ begin
   ) then
     alter table telegram_accounts add column workspace text not null default 'default';
   end if;
+
+  -- Per-account BotFather bot counter (Telegram caps bots at 20 per account).
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'telegram_accounts'
+    and column_name = 'bots_count'
+  ) then
+    alter table telegram_accounts add column bots_count integer not null default 0;
+  end if;
 end $$;
+
+-- Increment the bot counter for an account (mirrors increment_groups_count).
+create or replace function increment_bots_count(phone_number text, increment_amount integer)
+returns void
+language plpgsql
+as $$
+begin
+  update telegram_accounts
+  set bots_count = bots_count + increment_amount
+  where phone = phone_number;
+end;
+$$;
+
+-- Force an account's bot counter to a value (used to mark an account as having
+-- hit Telegram's 20-bot cap when BotFather refuses, so we stop retrying it).
+create or replace function set_bots_count(phone_number text, new_count integer)
+returns void
+language plpgsql
+as $$
+begin
+  update telegram_accounts
+  set bots_count = new_count
+  where phone = phone_number;
+end;
+$$;
 
 -- Add migration for first_creation_time if it exists
 do $$ 
@@ -281,8 +318,31 @@ grant all privileges on table group_creation_queue to service_role;
 grant all privileges on sequence group_creation_queue_id_seq to service_role;
 
 -- Create RLS policy for queue table
-CREATE POLICY "Allow full access to group_creation_queue" 
+CREATE POLICY "Allow full access to group_creation_queue"
 ON group_creation_queue
+FOR ALL
+USING (true)
+WITH CHECK (true);
+
+-- Bots created via BotFather. The token is the valuable output and enables a
+-- future "transfer ownership" action. Scoped by workspace like everything else.
+create table if not exists telegram_bots (
+  id serial primary key,
+  workspace text not null default 'default',
+  owner_phone text not null references telegram_accounts(phone),
+  username text not null unique,        -- the @handle, without a leading @
+  display_name text,
+  token text not null,                  -- BotFather HTTP API token
+  theme text,                           -- custom-pattern theme, null for default
+  created_at timestamptz not null default now()
+);
+
+alter table telegram_bots enable row level security;
+grant all privileges on table telegram_bots to service_role;
+grant all privileges on sequence telegram_bots_id_seq to service_role;
+
+CREATE POLICY "Allow full access to telegram_bots"
+ON telegram_bots
 FOR ALL
 USING (true)
 WITH CHECK (true);

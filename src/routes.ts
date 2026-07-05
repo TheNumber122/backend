@@ -12,6 +12,8 @@ import {
 import { supabase, protectedDb } from "./db/supabase";
 import { broadcastLog } from "./broadcast";
 import { getWorkspace } from "./workspace";
+import { generateBotUsernames, botDisplayName } from "./ai/groq";
+import { createBotViaBotFather } from "./telegram/botfather";
 
 // Queue processor
 let isProcessingQueue = false;
@@ -54,7 +56,8 @@ router.post("/queue/add", async (req: Request, res: Response) => {
     const { phone, group_count, naming_pattern, description, messages, type } =
       req.body;
 
-    const jobType = type === "channel" ? "channel" : "group";
+    const jobType =
+      type === "channel" ? "channel" : type === "bot" ? "bot" : "group";
 
     if (!phone || !group_count || !naming_pattern) {
       return res.status(400).json({
@@ -63,11 +66,13 @@ router.post("/queue/add", async (req: Request, res: Response) => {
       });
     }
 
+    // Bots cap at 20 per account (Telegram limit); groups/channels at 50.
+    const maxCount = jobType === "bot" ? 20 : 50;
     const count = Number(group_count);
-    if (!count || count < 1 || count > 50) {
+    if (!count || count < 1 || count > maxCount) {
       return res.status(400).json({
         success: false,
-        error: "group_count must be between 1 and 50",
+        error: `group_count must be between 1 and ${maxCount}`,
       });
     }
 
@@ -240,24 +245,42 @@ async function processNextQueueJob() {
       .update({ status: "processing", started_at: new Date().toISOString() })
       .eq("id", job.id);
 
+    const isBotJob = job.type === "bot";
     const jobType: "group" | "channel" =
       job.type === "channel" ? "channel" : "group";
+    const jobLabel = isBotJob ? "bot" : jobType;
 
     broadcastLog({
-      message: `Starting queued job #${job.id} for account ${job.phone} to create ${job.group_count} ${jobType}s`,
+      message: `Starting queued job #${job.id} for account ${job.phone} to create ${job.group_count} ${jobLabel}s`,
       type: "info",
       timestamp: new Date().toISOString(),
     });
 
     try {
-      const result = await createGroups(
-        job.phone,
-        job.group_count,
-        job.naming_pattern,
-        job.description,
-        job.messages,
-        jobType
-      );
+      let completedMsg: string;
+
+      if (isBotJob) {
+        // Bot jobs store the pattern choice in naming_pattern ('default'|'custom')
+        // and the theme in description.
+        const botResult = await createBots(
+          job.phone,
+          job.group_count,
+          job.naming_pattern === "custom",
+          job.description || undefined,
+          job.workspace || "default"
+        );
+        completedMsg = `Completed queued job #${job.id} for account ${job.phone} — created ${botResult.botsCreated}/${botResult.totalBots} bots`;
+      } else {
+        const result = await createGroups(
+          job.phone,
+          job.group_count,
+          job.naming_pattern,
+          job.description,
+          job.messages,
+          jobType
+        );
+        completedMsg = `Completed queued job #${job.id} for account ${job.phone} — created ${result.successfulGroups}/${result.totalGroups} ${jobType}s`;
+      }
 
       await supabase
         .from("group_creation_queue")
@@ -268,7 +291,7 @@ async function processNextQueueJob() {
         .eq("id", job.id);
 
       broadcastLog({
-        message: `Completed queued job #${job.id} for account ${job.phone} — created ${result.successfulGroups}/${result.totalGroups} ${jobType}s`,
+        message: completedMsg,
         type: "success",
         timestamp: new Date().toISOString(),
       });
@@ -629,6 +652,177 @@ async function createGroupsInner(
         await clearSession(phone);
       } catch (cleanupErr) {
         console.error("Error during session cleanup:", cleanupErr);
+      }
+    }
+  }
+}
+
+interface CreateBotsResult {
+  success: boolean;
+  totalBots: number;
+  botsCreated: number;
+}
+
+// Create `botCount` bots for one account via @BotFather, one at a time.
+// Serialized behind the same account lock as group creation so only one account
+// is ever active at once.
+async function createBots(
+  phone: string,
+  botCount: number,
+  useCustomPattern: boolean,
+  theme: string | undefined,
+  workspace: string
+): Promise<CreateBotsResult> {
+  return withAccountLock(() =>
+    createBotsInner(phone, botCount, useCustomPattern, theme, workspace)
+  );
+}
+
+async function createBotsInner(
+  phone: string,
+  botCount: number,
+  useCustomPattern: boolean,
+  theme: string | undefined,
+  workspace: string
+): Promise<CreateBotsResult> {
+  let client: any = null;
+  const usernameTheme = useCustomPattern ? theme : undefined;
+
+  try {
+    client = await getClientByPhone(phone);
+
+    // Verify the restored session is still usable; recreate once if not.
+    try {
+      await client.getMe();
+    } catch {
+      broadcastLog({
+        message: `Client validation failed for ${phone}, recreating session...`,
+        type: "error",
+        timestamp: new Date().toISOString(),
+      });
+      await clearSession(phone);
+      client = await getClientByPhone(phone);
+    }
+
+    broadcastLog({
+      message: `Starting creation of ${botCount} bots for account ${phone}`,
+      type: "info",
+      timestamp: new Date().toISOString(),
+    });
+
+    // Generate a small batch of candidate usernames up front (one AI call).
+    let pool = await generateBotUsernames({ count: botCount, theme: usernameTheme });
+    const triedAll: string[] = []; // every handle attempted, to avoid on refills
+
+    let created = 0;
+    let attempts = 0;
+    const maxAttempts = botCount + 8; // safety valve against runaway loops
+
+    while (created < botCount && attempts < maxAttempts) {
+      attempts++;
+
+      // Refill from the AI if we've exhausted the current pool.
+      if (pool.length === 0) {
+        pool = await generateBotUsernames({
+          count: botCount - created,
+          theme: usernameTheme,
+          avoid: triedAll,
+        });
+        if (pool.length === 0) {
+          broadcastLog({
+            message: `Could not generate any new usernames for ${phone}; stopping.`,
+            type: "error",
+            timestamp: new Date().toISOString(),
+          });
+          break;
+        }
+      }
+
+      // Feed BotFather one primary handle plus a few spares so a single /newbot
+      // cycle can absorb "username taken" collisions without extra AI calls.
+      const primary = pool.shift() as string;
+      const spares = pool.slice(0, 4);
+      const candidates = [primary, ...spares];
+
+      const result = await createBotViaBotFather(
+        client,
+        botDisplayName(primary),
+        candidates
+      );
+
+      // Drop everything BotFather tried from the pool and remember it.
+      for (const t of result.tried) {
+        triedAll.push(t);
+        const idx = pool.indexOf(t);
+        if (idx !== -1) pool.splice(idx, 1);
+      }
+
+      if (result.ok) {
+        // BotFather is asked for the display name up front (from the primary
+        // candidate) before a username is chosen, so store that exact name.
+        await supabase.from("telegram_bots").insert({
+          workspace,
+          owner_phone: phone,
+          username: result.username,
+          display_name: botDisplayName(primary),
+          token: result.token,
+          theme: useCustomPattern ? theme || null : null,
+        });
+        await supabase.rpc("increment_bots_count", {
+          phone_number: phone,
+          increment_amount: 1,
+        });
+        created++;
+
+        // Log the handle only — never the raw token (the WS log is global).
+        broadcastLog({
+          message: `Created bot @${result.username} for account ${phone} (${created}/${botCount})`,
+          type: "success",
+          timestamp: new Date().toISOString(),
+        });
+      } else if (result.reason === "limit") {
+        // Account already at Telegram's 20-bot cap (possibly from earlier bots).
+        // Force the counter to the cap so the UI reflects it and we skip ahead.
+        broadcastLog({
+          message: `Account ${phone} has reached Telegram's 20-bot limit. Marking as full and skipping.`,
+          type: "error",
+          timestamp: new Date().toISOString(),
+        });
+        await supabase.rpc("set_bots_count", {
+          phone_number: phone,
+          new_count: 20,
+        });
+        break;
+      } else if (result.reason === "flood") {
+        broadcastLog({
+          message: `BotFather rate-limited account ${phone} (${result.message}). Stopping this account.`,
+          type: "error",
+          timestamp: new Date().toISOString(),
+        });
+        break;
+      } else {
+        // no_username: all candidates in this cycle were rejected — loop will
+        // refill and try fresh names on the next iteration.
+        broadcastLog({
+          message: `No available username found this round for ${phone}; retrying with new names.`,
+          type: "info",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      // Human-like gap between bots.
+      if (created < botCount) {
+        await new Promise((resolve) => setTimeout(resolve, 4000));
+      }
+    }
+
+    return { success: true, totalBots: botCount, botsCreated: created };
+  } finally {
+    if (client) {
+      try {
+        await clearSession(phone);
+      } catch (cleanupErr) {
+        console.error("Error during bot session cleanup:", cleanupErr);
       }
     }
   }
@@ -1042,5 +1236,86 @@ router.post(
     }
   }
 );
+
+// POST /bots/create - create N bots for one account via BotFather (synchronous)
+router.post("/bots/create", async (req: Request, res: Response) => {
+  const ws = getWorkspace(req);
+  const { phone, botCount, useCustomPattern, theme } = req.body;
+
+  if (!phone || typeof phone !== "string") {
+    return res.status(400).json({ error: "Missing or invalid phone" });
+  }
+  const count = Number(botCount);
+  if (!count || count < 1 || count > 20) {
+    return res.status(400).json({ error: "botCount must be between 1 and 20" });
+  }
+  if (useCustomPattern && (!theme || typeof theme !== "string")) {
+    return res
+      .status(400)
+      .json({ error: "A theme is required when using a custom pattern" });
+  }
+
+  try {
+    // Ensure the account belongs to the caller's workspace.
+    const { data: owned } = await supabase
+      .from("telegram_accounts")
+      .select("phone")
+      .eq("phone", phone)
+      .eq("workspace", ws)
+      .single();
+    if (!owned) {
+      return res.status(404).json({ success: false, error: "Account not found" });
+    }
+
+    const result = await createBots(
+      phone,
+      count,
+      !!useCustomPattern,
+      theme,
+      ws
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        botsCreated: result.botsCreated,
+        totalBots: result.totalBots,
+      },
+    });
+  } catch (err: any) {
+    broadcastLog({
+      message: `Unexpected error creating bots: ${err.message}`,
+      type: "error",
+      timestamp: new Date().toISOString(),
+    });
+    return res.status(500).json({
+      success: false,
+      error: err.message || "An unexpected error occurred",
+    });
+  }
+});
+
+// GET /bots - list bots for the caller's workspace (tokens omitted for safety)
+router.get("/bots", async (req: Request, res: Response) => {
+  const ws = getWorkspace(req);
+  try {
+    const { data, error } = await supabase
+      .from("telegram_bots")
+      .select("id, username, display_name, owner_phone, theme, created_at")
+      .eq("workspace", ws)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("Supabase error (bots):", error);
+      return res.status(500).json({ success: false, error: "Failed to fetch bots" });
+    }
+
+    return res.json({ success: true, data: data || [] });
+  } catch (err: any) {
+    return res
+      .status(500)
+      .json({ success: false, error: err.message || "Failed to fetch bots" });
+  }
+});
 
 export default router;
