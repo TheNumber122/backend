@@ -224,10 +224,12 @@ router.delete("/queue/:id", async (req: Request, res: Response) => {
   }
 });
 
-// Short spacing between consecutive bot creations on the SAME account. The real
-// safety gate is the 3-per-24h daily limit (check_bot_limits), so this is just a
-// light anti-flood gap — kept small for speed. Override via env.
-const BOT_COOLDOWN_MS = Number(process.env.BOT_COOLDOWN_MS) || 60 * 1000;
+// Cooldown before the SAME account may make its next bot (round-robin works other
+// accounts meanwhile). Default 5 min, per the requested "1 bot per account / 5min".
+const BOT_COOLDOWN_MS = Number(process.env.BOT_COOLDOWN_MS) || 5 * 60 * 1000;
+// Gap after finishing (and disconnecting) one account before touching the next
+// account — a short breather between every bot step, whichever account is next.
+const BOT_INTER_ACCOUNT_MS = Number(process.env.BOT_INTER_ACCOUNT_MS) || 30 * 1000;
 // Back-off when BotFather actively rate-limits us ("too many attempts") but did
 // NOT tell us how long to wait. When it DOES give a number ("try again in 129
 // seconds") we honor that exact time instead (see runOneBotStep).
@@ -335,6 +337,8 @@ async function processQueue() {
       }
 
       await runOneBotStep(botJob);
+      // Breather after disconnecting this account before moving to the next one.
+      await sleep(BOT_INTER_ACCOUNT_MS);
     }
   } catch (err: any) {
     broadcastLog({
