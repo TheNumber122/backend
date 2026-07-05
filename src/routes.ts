@@ -176,13 +176,13 @@ router.post("/queue/add", async (req: Request, res: Response) => {
   }
 });
 
-router.get("/queue", async (req: Request, res: Response) => {
+router.get("/queue", async (_req: Request, res: Response) => {
   try {
-    const ws = getWorkspace(req);
+    // Shared dashboard: the console log is global, so the queue is shown to all
+    // users too (both workspaces see every job). Creation stays workspace-scoped.
     const { data: jobs, error } = await supabase
       .from("group_creation_queue")
       .select("*")
-      .eq("workspace", ws)
       .order("created_at", { ascending: false });
 
     if (error) {
@@ -206,14 +206,13 @@ router.get("/queue", async (req: Request, res: Response) => {
 
 router.delete("/queue/:id", async (req: Request, res: Response) => {
   try {
-    const ws = getWorkspace(req);
     const { id } = req.params;
 
+    // Shared dashboard: any user can remove any job from the common queue view.
     const { error } = await supabase
       .from("group_creation_queue")
       .delete()
-      .eq("id", id)
-      .eq("workspace", ws);
+      .eq("id", id);
 
     if (error) {
       return res.status(500).json({
@@ -1574,7 +1573,11 @@ router.get("/bots", async (req: Request, res: Response) => {
 
 let isProcessingMessaging = false;
 
-const MESSAGING_INTER_ACCOUNT_MS = 15 * 1000; // breather after each account
+// Breather after finishing (and disconnecting) one account's round before the
+// next account comes online. Kept at 1 min as an anti-ban safety gap so we never
+// hop between accounts back-to-back. Override via env if needed.
+const MESSAGING_INTER_ACCOUNT_MS =
+  Number(process.env.MESSAGING_INTER_ACCOUNT_MS) || 60 * 1000;
 const MESSAGING_FLOOD_DEFAULT_MS = 15 * 60 * 1000; // park time when flood gives no number
 const MESSAGING_CANCEL_CHECK_EVERY = 25; // re-check cancellation every N sends
 
@@ -2016,14 +2019,13 @@ router.post("/messaging/jobs", async (req: Request, res: Response) => {
   }
 });
 
-// GET /messaging/jobs — list jobs (with per-account progress) for the workspace.
-router.get("/messaging/jobs", async (req: Request, res: Response) => {
+// GET /messaging/jobs — list jobs with per-account progress. Shared across users
+// (like the console log), so both workspaces see every messaging job.
+router.get("/messaging/jobs", async (_req: Request, res: Response) => {
   try {
-    const ws = getWorkspace(req);
     const { data: jobs, error } = await supabase
       .from("messaging_jobs")
       .select("*, targets:messaging_targets(*)")
-      .eq("workspace", ws)
       .order("created_at", { ascending: false });
     if (error) {
       return res.status(500).json({ success: false, error: `Failed to list jobs: ${error.message}` });
@@ -2037,13 +2039,12 @@ router.get("/messaging/jobs", async (req: Request, res: Response) => {
 // DELETE /messaging/jobs/:id — cancel a job (scheduler skips non-active jobs).
 router.delete("/messaging/jobs/:id", async (req: Request, res: Response) => {
   try {
-    const ws = getWorkspace(req);
     const { id } = req.params;
+    // Shared dashboard: any user can cancel any messaging job from the common view.
     const { data: job } = await supabase
       .from("messaging_jobs")
       .select("*")
       .eq("id", id)
-      .eq("workspace", ws)
       .single();
     if (!job) {
       return res.status(404).json({ success: false, error: "Job not found." });
@@ -2051,8 +2052,7 @@ router.delete("/messaging/jobs/:id", async (req: Request, res: Response) => {
     await supabase
       .from("messaging_jobs")
       .update({ status: "cancelled", completed_at: new Date().toISOString() })
-      .eq("id", id)
-      .eq("workspace", ws);
+      .eq("id", id);
     cleanupJobImage(job);
     return res.json({ success: true, message: `Job ${id} cancelled.` });
   } catch (err: any) {
