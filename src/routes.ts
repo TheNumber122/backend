@@ -228,13 +228,49 @@ router.delete("/queue/:id", async (req: Request, res: Response) => {
 // safety gate is the 3-per-24h daily limit (check_bot_limits), so this is just a
 // light anti-flood gap — kept small for speed. Override via env.
 const BOT_COOLDOWN_MS = Number(process.env.BOT_COOLDOWN_MS) || 60 * 1000;
-// Longer back-off when BotFather actively rate-limits ("too many attempts").
+// Back-off when BotFather actively rate-limits us ("too many attempts") but did
+// NOT tell us how long to wait. When it DOES give a number ("try again in 129
+// seconds") we honor that exact time instead (see runOneBotStep).
 const BOT_FLOOD_BACKOFF_MS =
   Number(process.env.BOT_FLOOD_BACKOFF_MS) || 30 * 60 * 1000;
+// Back-off after a generic failure (timeout / unexpected error). Conservative so
+// a broken account can't hammer BotFather; other accounts run meanwhile.
+const BOT_ERROR_BACKOFF_MS =
+  Number(process.env.BOT_ERROR_BACKOFF_MS) || 30 * 60 * 1000;
+// A flood delay is never allowed to be shorter than this (BotFather can lie low).
+const BOT_FLOOD_MIN_MS = 60 * 1000;
+// ...nor longer than this from a single "try again in N" reply (safety ceiling).
+const BOT_FLOOD_MAX_MS = 6 * 60 * 60 * 1000;
 // Cap on a single cooldown sleep so newly-enqueued jobs get picked up promptly.
 const SCHEDULER_MAX_SLEEP_MS = 60 * 1000;
 // Give up on a bot job after this many failed attempts (per job) to avoid loops.
 const MAX_BOT_FAILURES = 12;
+
+// Turn a bot-step failure into the number of ms to wait before retrying it.
+// Foolproof by construction: every non-success reason maps to a bounded, always
+// positive delay, so a job can never spin without pause or wait forever.
+//   • flood + parsed seconds → that exact time (clamped 1m…6h) + 5s jitter buffer
+//   • flood, no number        → BOT_FLOOD_BACKOFF_MS (30m)
+//   • timeout / error         → BOT_ERROR_BACKOFF_MS (30m)
+//   • no_username             → BOT_COOLDOWN_MS (short; just AI name collisions)
+function backoffForBotFailure(res: SingleBotResult): {
+  ms: number;
+  detail: string;
+} {
+  if (res.status === "flood") {
+    if (res.retryAfterMs && res.retryAfterMs > 0) {
+      const ms = Math.min(
+        Math.max(res.retryAfterMs + 5000, BOT_FLOOD_MIN_MS),
+        BOT_FLOOD_MAX_MS
+      );
+      return { ms, detail: `BotFather asked to wait ${Math.round(res.retryAfterMs / 1000)}s` };
+    }
+    return { ms: BOT_FLOOD_BACKOFF_MS, detail: "flood (no time given)" };
+  }
+  if (res.status === "no_username") return { ms: BOT_COOLDOWN_MS, detail: "name collisions" };
+  // timeout / error / anything unexpected → conservative fixed back-off.
+  return { ms: BOT_ERROR_BACKOFF_MS, detail: res.status };
+}
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -508,16 +544,17 @@ async function runOneBotStep(job: any) {
     return;
   }
 
-  const backoff = res.status === "flood" ? BOT_FLOOD_BACKOFF_MS : BOT_COOLDOWN_MS;
+  const { ms: backoff, detail } = backoffForBotFailure(res);
   const nextAt = new Date(Date.now() + backoff).toISOString();
   await supabase
     .from("group_creation_queue")
     .update({ bots_attempts: newFailures, next_attempt_at: nextAt, status: "processing" })
     .eq("id", job.id);
+  const mins = backoff / 60000;
+  const human = mins >= 1 ? `~${Math.round(mins)} min` : `~${Math.round(backoff / 1000)}s`;
   log(
-    `Bot attempt for ${job.phone} did not succeed (${res.status}). Retrying in ~${Math.round(
-      backoff / 60000
-    )} min. [${newFailures}/${MAX_BOT_FAILURES} failures]`,
+    `Bot attempt for ${job.phone} did not succeed (${res.status}: ${detail}). ` +
+      `Retrying in ${human}. [${newFailures}/${MAX_BOT_FAILURES} failures]`,
     "error"
   );
 }
@@ -860,6 +897,8 @@ async function createGroupsInner(
 interface SingleBotResult {
   status: "created" | "limit" | "flood" | "timeout" | "error" | "no_username";
   username?: string;
+  // When status is "flood" and BotFather named a delay, this is that delay in ms.
+  retryAfterMs?: number;
 }
 
 // Create exactly ONE bot for an account via @BotFather. Serialized behind the
@@ -954,7 +993,14 @@ async function createSingleBotInner(
       return { status: "created", username: result.username };
     }
 
-    return { status: result.reason };
+    // Surface BotFather's exact "try again in N seconds" delay for flood cases.
+    return {
+      status: result.reason,
+      retryAfterMs:
+        result.reason === "flood" && result.retryAfter
+          ? result.retryAfter * 1000
+          : undefined,
+    };
   } catch (err: any) {
     log(`Unexpected error creating bot for ${phone}: ${err?.message || err}`, "error");
     return { status: "error" };
@@ -1109,7 +1155,7 @@ router.get("/accounts", async (req: Request, res: Response) => {
     const { data, error } = await supabase
       .from("telegram_accounts")
       .select(
-        "phone, username, groups_count, channels_count, bots_count, bots_created_24h, groups_created_24h, next_available_time, flood_wait_until"
+        "phone, username, groups_count, channels_count, bots_count, bots_created_24h, bots_next_reset, groups_created_24h, next_available_time, flood_wait_until"
       )
       .eq("workspace", ws)
       .order("phone", { ascending: true });
@@ -1140,6 +1186,7 @@ router.get("/accounts", async (req: Request, res: Response) => {
                 channels_count: account.channels_count || 0,
                 bots_count: account.bots_count || 0,
                 bots_created_24h: account.bots_created_24h || 0,
+                bots_next_reset: account.bots_next_reset || null,
                 groups_created_24h: account.groups_created_24h || 0,
                 next_available_time: effectiveAvailableTime,
                 rateLimitInfo: null,
@@ -1152,6 +1199,7 @@ router.get("/accounts", async (req: Request, res: Response) => {
               channels_count: account.channels_count || 0,
               bots_count: account.bots_count || 0,
               bots_created_24h: account.bots_created_24h || 0,
+              bots_next_reset: account.bots_next_reset || null,
               groups_created_24h:
                 (rateLimitInfo.groups_created_24h ??
                   account.groups_created_24h) ||

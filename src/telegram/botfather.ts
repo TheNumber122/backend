@@ -22,9 +22,28 @@ export type BotFatherResult =
       reason: "limit" | "flood" | "timeout" | "no_username" | "error";
       message: string;
       tried: string[];
+      // For "flood": the exact number of seconds BotFather told us to wait, if it
+      // gave one (e.g. "try again in 129 seconds"). undefined = no number parsed.
+      retryAfter?: number;
     };
 
 const TOKEN_RE = /(\d{8,10}:[A-Za-z0-9_-]{35})/;
+
+// BotFather flood replies often name a delay, e.g.
+//   "Sorry, too many attempts. Please try again in 129 seconds."
+//   "...try again in 5 minutes."
+// Pull that out so the scheduler can wait the exact time instead of a blind 30m.
+function parseRetrySeconds(text: string): number | undefined {
+  const t = (text || "").toLowerCase();
+  const m = t.match(/try again in (\d+)\s*(second|minute|hour)/);
+  if (!m) return undefined;
+  const n = parseInt(m[1], 10);
+  if (!Number.isFinite(n)) return undefined;
+  const unit = m[2];
+  if (unit === "hour") return n * 3600;
+  if (unit === "minute") return n * 60;
+  return n;
+}
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -96,7 +115,14 @@ export async function createBotViaBotFather(
       log(`BotFather ⇐ ${short(reply.text)}`);
       let stage = classifyPreUsernameReply(reply.text);
       if (stage === "limit") return { ok: false, reason: "limit", message: reply.text, tried };
-      if (stage === "flood") return { ok: false, reason: "flood", message: reply.text, tried };
+      if (stage === "flood")
+        return {
+          ok: false,
+          reason: "flood",
+          message: reply.text,
+          tried,
+          retryAfter: parseRetrySeconds(reply.text),
+        };
 
       // 2. Provide the display name (BotFather then asks for a username).
       log(`BotFather → name: "${displayName}"`);
@@ -106,7 +132,14 @@ export async function createBotViaBotFather(
       log(`BotFather ⇐ ${short(reply.text)}`);
       stage = classifyPreUsernameReply(reply.text);
       if (stage === "limit") return { ok: false, reason: "limit", message: reply.text, tried };
-      if (stage === "flood") return { ok: false, reason: "flood", message: reply.text, tried };
+      if (stage === "flood")
+        return {
+          ok: false,
+          reason: "flood",
+          message: reply.text,
+          tried,
+          retryAfter: parseRetrySeconds(reply.text),
+        };
 
       // 3. Try usernames until one is accepted or we run out.
       for (const username of candidates) {
@@ -123,7 +156,14 @@ export async function createBotViaBotFather(
           return { ok: true, token, username, tried };
         }
         if (verdict === "limit") return { ok: false, reason: "limit", message: reply.text, tried };
-        if (verdict === "flood") return { ok: false, reason: "flood", message: reply.text, tried };
+        if (verdict === "flood")
+          return {
+            ok: false,
+            reason: "flood",
+            message: reply.text,
+            tried,
+            retryAfter: parseRetrySeconds(reply.text),
+          };
         // taken / invalid / unknown → BotFather still waits; try next candidate.
       }
 
