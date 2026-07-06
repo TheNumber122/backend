@@ -1452,14 +1452,32 @@ router.get("/accounts", async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Failed to fetch accounts" });
     }
 
-    // For each account, call check_rate_limit and merge the result
+    // For each account, call check_rate_limit AND check_bot_limits and merge the
+    // result. Both RPCs reset their rolling 24h counter as a side effect once the
+    // window elapses, so calling them on read keeps the dashboard fresh. Without
+    // the check_bot_limits call the bot counter would show a stale "3/3" until the
+    // next actual bot run (it's the only other place that runs the reset).
     const accounts = data
       ? await Promise.all(
           data.map(async (account) => {
-            const { data: rateLimitInfo, error: rateLimitError } =
-              await supabase.rpc("check_rate_limit", {
-                account_phone: account.phone,
-              });
+            const [
+              { data: rateLimitInfo, error: rateLimitError },
+              { data: botLimitInfo },
+            ] = await Promise.all([
+              supabase.rpc("check_rate_limit", { account_phone: account.phone }),
+              supabase.rpc("check_bot_limits", { account_phone: account.phone }),
+            ]);
+
+            // Prefer the RPC's post-reset values; fall back to the raw column.
+            // When the daily counter is 0 there is no active window, so drop any
+            // stale next_reset marker so the UI doesn't show a phantom countdown.
+            const botsCreated24h =
+              botLimitInfo?.bots_created_24h ?? account.bots_created_24h ?? 0;
+            const botsNextReset =
+              botsCreated24h > 0
+                ? botLimitInfo?.next_reset ?? account.bots_next_reset ?? null
+                : null;
+
             // Surface whichever block is actually active so the client
             // countdown reflects a real flood wait, not just the window marker.
             const effectiveAvailableTime =
@@ -1472,8 +1490,8 @@ router.get("/accounts", async (req: Request, res: Response) => {
                 groups_count: account.groups_count || 0,
                 channels_count: account.channels_count || 0,
                 bots_count: account.bots_count || 0,
-                bots_created_24h: account.bots_created_24h || 0,
-                bots_next_reset: account.bots_next_reset || null,
+                bots_created_24h: botsCreated24h,
+                bots_next_reset: botsNextReset,
                 groups_created_24h: account.groups_created_24h || 0,
                 next_available_time: effectiveAvailableTime,
                 rateLimitInfo: null,
@@ -1485,8 +1503,8 @@ router.get("/accounts", async (req: Request, res: Response) => {
               groups_count: account.groups_count || 0,
               channels_count: account.channels_count || 0,
               bots_count: account.bots_count || 0,
-              bots_created_24h: account.bots_created_24h || 0,
-              bots_next_reset: account.bots_next_reset || null,
+              bots_created_24h: botsCreated24h,
+              bots_next_reset: botsNextReset,
               groups_created_24h:
                 (rateLimitInfo.groups_created_24h ??
                   account.groups_created_24h) ||
