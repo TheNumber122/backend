@@ -65,6 +65,52 @@ router.post(
   }
 );
 
+// Reset the self-imposed 3-bots-per-24h window for the caller's accounts AND wake
+// any bot jobs parked waiting on that window, so bot creation resumes immediately.
+// This is the bot-side analog of /accounts/set-all-available (which clears the
+// group rate limit). It does NOT touch bots_count, so the hard Telegram 20-bot
+// total cap still applies. Use it to re-run bots without waiting out the ~24h
+// window — mainly for testing. NOTE: the 3/24h throttle exists to avoid BotFather
+// flood-bans; clearing it repeatedly and creating many bots fast raises that risk.
+router.post(
+  "/accounts/reset-bot-limits",
+  async (req: Request, res: Response) => {
+    try {
+      const ws = getWorkspace(req);
+
+      // 1. Clear the rolling daily bot counter for this workspace's accounts.
+      const { error: acctError } = await supabase
+        .from("telegram_accounts")
+        .update({ bots_created_24h: 0, bots_next_reset: null })
+        .eq("workspace", ws);
+      if (acctError) throw acctError;
+
+      // 2. Wake bot jobs that were parked on next_attempt_at (e.g. by the daily
+      //    cap or a back-off) so the scheduler retries them now instead of at the
+      //    old due time. Leaving status as-is; the scheduler picks them up.
+      const { error: jobError } = await supabase
+        .from("group_creation_queue")
+        .update({ next_attempt_at: null })
+        .eq("workspace", ws)
+        .eq("type", "bot")
+        .in("status", ["pending", "processing"]);
+      if (jobError) throw jobError;
+
+      // Kick the scheduler so the woken jobs run without waiting for the next tick.
+      processQueue();
+
+      res.json({
+        success: true,
+        message: "Bot daily limits cleared; parked bot jobs will resume now.",
+      });
+    } catch (error: any) {
+      res
+        .status(500)
+        .json({ success: false, error: error?.message || "Failed to reset bot limits" });
+    }
+  }
+);
+
 // Queue routes
 router.post("/queue/add", async (req: Request, res: Response) => {
   try {
