@@ -413,6 +413,11 @@ async function runBatchJob(job: any) {
   const jobType: "group" | "channel" =
     job.type === "channel" ? "channel" : "group";
 
+  // Progress already recorded for this job from an earlier (possibly crashed)
+  // run. createGroups resumes from here so it never repeats a group or reuses a
+  // number.
+  const alreadyDone = job.bots_done ?? 0;
+
   try {
     // Claim the job (pending → processing) INSIDE the try: if this update itself
     // throws (transient DB error), we fall through to the catch and mark the job
@@ -423,7 +428,9 @@ async function runBatchJob(job: any) {
       .eq("id", job.id);
 
     broadcastLog({
-      message: `Starting queued job #${job.id} for account ${job.phone} to create ${job.group_count} ${jobType}s`,
+      message:
+        `Starting queued job #${job.id} for account ${job.phone} to create ${job.group_count} ${jobType}s` +
+        (alreadyDone > 0 ? ` (resuming from ${alreadyDone} already done)` : ""),
       type: "info",
       timestamp: new Date().toISOString(),
     });
@@ -435,7 +442,9 @@ async function runBatchJob(job: any) {
       job.description,
       job.messages,
       jobType,
-      job.workspace || "default"
+      job.workspace || "default",
+      job.id,
+      alreadyDone
     );
 
     await supabase
@@ -444,7 +453,7 @@ async function runBatchJob(job: any) {
       .eq("id", job.id);
 
     broadcastLog({
-      message: `Completed queued job #${job.id} for account ${job.phone} — created ${result.successfulGroups}/${result.totalGroups} ${jobType}s`,
+      message: `Completed queued job #${job.id} for account ${job.phone} — ${result.totalDone}/${result.totalGroups} ${jobType}s done (${result.successfulGroups} this run)`,
       type: "success",
       timestamp: new Date().toISOString(),
     });
@@ -643,18 +652,27 @@ async function runOneBotStep(job: any) {
 // crash carry an old `started_at`, so they're recovered on the first boot/tick.
 const ORPHAN_STALE_MS = Number(process.env.ORPHAN_STALE_MS) || 2 * 60 * 60 * 1000;
 
-async function recoverOrphanedJobs() {
+// `immediate` (boot): reset ALL processing batch rows — a fresh process has no
+// loop running, so every processing row is by definition orphaned, and resume is
+// safe (bots_done is preserved and createGroups continues from it). `immediate`
+// false (tick): only reset rows older than the staleness window, since a live loop
+// may legitimately hold a job in processing for up to ~1h during an inline flood
+// wait. bots_done is never cleared, so progress survives the reset.
+async function recoverOrphanedJobs(immediate = false) {
   try {
-    const cutoff = new Date(Date.now() - ORPHAN_STALE_MS).toISOString();
-    // Reset stale processing batch jobs back to pending. Include rows with a null
-    // started_at (claimed but never stamped) as a safety net.
-    const { data: reset, error } = await supabase
+    let query = supabase
       .from("group_creation_queue")
       .update({ status: "pending", started_at: null })
       .in("type", ["group", "channel"])
-      .eq("status", "processing")
-      .or(`started_at.is.null,started_at.lt.${cutoff}`)
-      .select("id");
+      .eq("status", "processing");
+
+    if (!immediate) {
+      const cutoff = new Date(Date.now() - ORPHAN_STALE_MS).toISOString();
+      // Include rows with a null started_at (claimed but never stamped) as a safety net.
+      query = query.or(`started_at.is.null,started_at.lt.${cutoff}`);
+    }
+
+    const { data: reset, error } = await query.select("id");
 
     if (error) {
       broadcastLog({
@@ -689,8 +707,9 @@ export function startQueueProcessor() {
     type: "info",
     timestamp: new Date().toISOString(),
   });
-  // Reconcile stranded jobs from a prior crash/restart, then kick the loop.
-  recoverOrphanedJobs().finally(() => processQueue());
+  // Reconcile stranded jobs from a prior crash/restart, then kick the loop. At
+  // boot nothing is running, so recover ALL orphaned batch rows immediately.
+  recoverOrphanedJobs(true).finally(() => processQueue());
 
   // Self-healing tick: re-drain the queue on a fixed interval. This is the key
   // safeguard — the loop is otherwise only started on boot and on enqueue, so any
@@ -706,11 +725,55 @@ export function startQueueProcessor() {
 interface CreateGroupsResult {
   success: boolean;
   totalGroups: number;
-  successfulGroups: number;
+  successfulGroups: number; // groups created in THIS run
+  totalDone: number; // cumulative for the job (alreadyDone + this run)
   results: any[];
 }
 
-// Single source of truth for group/channel creation logic
+// Persist ONE successful group/channel creation immediately. Doing this per group
+// (instead of once at the end) means a crash mid-batch never loses the count or
+// lets a resume reuse a number. It's effectively free at scale: the global account
+// lock + the 5s inter-group delay cap creations at ~1 every 5s system-wide.
+//   • account groups_count (+ groups_created_24h) bumps by 1 — drives {n} numbering
+//     and the rate limits, and is what was previously lost on a crash.
+//   • channels_count bumps too for channels (display breakdown).
+//   • the 24h window marker starts on the first success (idempotent via coalesce).
+//   • the queue row's bots_done advances to the running per-job total so a resume
+//     continues from exactly here (no duplicates, no over-creation).
+async function persistOneCreation(
+  phone: string,
+  type: "group" | "channel",
+  jobId: number | undefined,
+  doneForJob: number,
+  isFirstSuccess: boolean
+): Promise<void> {
+  await supabase.rpc("increment_groups_count", {
+    phone_number: phone,
+    increment_amount: 1,
+  });
+  if (type === "channel") {
+    await supabase.rpc("increment_channels_count", {
+      phone_number: phone,
+      increment_amount: 1,
+    });
+  }
+  if (isFirstSuccess) {
+    await supabase.rpc("update_rate_limit_status", {
+      account_phone: phone,
+      groups_created: 1,
+    });
+  }
+  if (jobId != null) {
+    await supabase
+      .from("group_creation_queue")
+      .update({ bots_done: doneForJob })
+      .eq("id", jobId);
+  }
+}
+
+// Single source of truth for group/channel creation logic.
+// jobId/alreadyDone are set for queued batch jobs so progress is durable and
+// resumable; the direct POST /groups/create path leaves them at their defaults.
 async function createGroups(
   phone: string,
   groupCount: number,
@@ -718,7 +781,9 @@ async function createGroups(
   description?: string,
   messages?: any[],
   type: "group" | "channel" = "group",
-  workspace: string = "default"
+  workspace: string = "default",
+  jobId?: number,
+  alreadyDone: number = 0
 ): Promise<CreateGroupsResult> {
   // Serialize: only one account may be active at a time.
   return withAccountLock(() =>
@@ -729,7 +794,9 @@ async function createGroups(
       description,
       messages,
       type,
-      workspace
+      workspace,
+      jobId,
+      alreadyDone
     )
   );
 }
@@ -741,7 +808,9 @@ async function createGroupsInner(
   description?: string,
   messages?: any[],
   type: "group" | "channel" = "group",
-  workspace: string = "default"
+  workspace: string = "default",
+  jobId?: number,
+  alreadyDone: number = 0
 ): Promise<CreateGroupsResult> {
   const entity = type === "channel" ? "channel" : "group";
   let client: any = null;
@@ -801,8 +870,18 @@ async function createGroupsInner(
     const results = [];
     let successfulGroups = 0;
 
+    // Resume-aware: only create what this job still owes. alreadyDone reflects the
+    // successes durably recorded in a previous (crashed) run, so a re-run never
+    // repeats them. `liveCount` drives {n} and advances only on success, so numbers
+    // stay contiguous across crashes (currentGroupsCount already includes any prior
+    // successes because we persist per group).
+    const remaining = Math.max(0, groupCount - alreadyDone);
+    let liveCount = currentGroupsCount;
+
     broadcastLog({
-      message: `Starting creation of ${groupCount} ${entity}s for account ${phone}`,
+      message:
+        `Starting creation of ${remaining} ${entity}s for account ${phone}` +
+        (alreadyDone > 0 ? ` (resuming — ${alreadyDone}/${groupCount} already done)` : ""),
       type: "info",
       timestamp: new Date().toISOString(),
     });
@@ -813,8 +892,8 @@ async function createGroupsInner(
       timestamp: new Date().toISOString(),
     });
 
-    for (let i = 1; i <= groupCount; i++) {
-      const groupNumber = currentGroupsCount + i;
+    for (let k = 0; k < remaining; k++) {
+      const groupNumber = liveCount + 1;
       const randomUsername = generateRandomUsername();
       const title = namingPattern
         .replace("{n}", groupNumber.toString())
@@ -827,7 +906,6 @@ async function createGroupsInner(
         if (chat && chat.id) {
           groupResult.success = true;
           groupResult.id = chat.id;
-          successfulGroups++;
 
           broadcastLog({
             message: `Created ${entity} ${title} for account ${phone}`,
@@ -913,7 +991,6 @@ async function createGroupsInner(
             if (chat && chat.id) {
               groupResult.success = true;
               groupResult.id = chat.id;
-              successfulGroups++;
 
               broadcastLog({
                 message: `Successfully created ${entity} ${title} after flood wait retry`,
@@ -978,40 +1055,48 @@ async function createGroupsInner(
         }
       }
 
+      // Persist this creation immediately (count + numbering + job progress) so a
+      // crash on the very next line can't lose it. Best-effort: a transient write
+      // failure logs and continues rather than aborting the whole batch.
+      if (groupResult.success) {
+        successfulGroups++;
+        liveCount++;
+        try {
+          await persistOneCreation(
+            phone,
+            type,
+            jobId,
+            alreadyDone + successfulGroups,
+            successfulGroups === 1
+          );
+        } catch (persistErr: any) {
+          broadcastLog({
+            message: `Warning: created ${title} but failed to persist its count (${
+              persistErr?.message || persistErr
+            }). Continuing.`,
+            type: "error",
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
+
       results.push(groupResult);
 
-      // Delay between groups (skip delay after last group or after a rate limit break)
-      if (i < groupCount) {
+      // Delay between groups (skip delay after the last one or after a break above).
+      if (k < remaining - 1) {
         await new Promise((resolve) => setTimeout(resolve, 5000));
       }
     }
 
-    // Update groups count in database
-    if (successfulGroups > 0) {
-      await supabase.rpc("increment_groups_count", {
-        phone_number: phone,
-        increment_amount: successfulGroups,
-      });
-
-      // Track channels separately (subset of groups_count) so the UI can show a
-      // groups/channels breakdown. groups_count stays the combined total.
-      if (type === "channel") {
-        await supabase.rpc("increment_channels_count", {
-          phone_number: phone,
-          increment_amount: successfulGroups,
-        });
-      }
-
-      await supabase.rpc("update_rate_limit_status", {
-        account_phone: phone,
-        groups_created: successfulGroups,
-      });
-    }
+    // NOTE: counts are now persisted per group (see persistOneCreation above), so
+    // there is deliberately no bulk end-of-batch increment here — that end-only
+    // write is exactly what lost progress when a run crashed mid-batch.
 
     return {
       success: true,
       totalGroups: groupCount,
       successfulGroups,
+      totalDone: alreadyDone + successfulGroups,
       results,
     };
   } catch (err: any) {
