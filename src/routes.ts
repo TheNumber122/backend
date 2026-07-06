@@ -278,6 +278,13 @@ const BOT_FLOOD_MAX_MS = 6 * 60 * 60 * 1000;
 const SCHEDULER_MAX_SLEEP_MS = 60 * 1000;
 // Give up on a bot job after this many failed attempts (per job) to avoid loops.
 const MAX_BOT_FAILURES = 12;
+// Self-healing tick: the scheduler is otherwise only kicked on boot and on each
+// enqueue, so a single transient error (or an early return on a DB hiccup) used
+// to strand every remaining job until the next enqueue — which never comes after
+// a burst. A periodic tick re-drains any pending/parked/resumable work. It is a
+// no-op whenever a loop is already running (guarded by the isProcessing* flags),
+// so it costs ~2 cheap queries per interval when idle.
+const QUEUE_TICK_MS = Number(process.env.QUEUE_TICK_MS) || 20 * 1000;
 
 // Turn a bot-step failure into the number of ms to wait before retrying it.
 // Foolproof by construction: every non-success reason maps to a bounded, always
@@ -325,51 +332,69 @@ async function processQueue() {
   if (isProcessingQueue) return;
   isProcessingQueue = true;
   try {
-    // Loop until no work remains; then release so a future enqueue restarts us.
+    // Loop until no work remains; then release so a future enqueue (or the
+    // periodic tick) restarts us. Each iteration is wrapped in its own try/catch
+    // so a transient failure (a dropped Supabase connection, a throw from a job
+    // step) can never kill the whole loop and strand every remaining job — the
+    // exact failure mode that left jobs "processing but doing nothing". On error
+    // we log, pause briefly to avoid a tight spin, and continue draining.
     // eslint-disable-next-line no-constant-condition
     while (true) {
-      // 1. Group/channel batch jobs take priority and run to completion.
-      const { data: batchJob } = await supabase
-        .from("group_creation_queue")
-        .select("*")
-        .eq("status", "pending")
-        .in("type", ["group", "channel"])
-        .order("created_at", { ascending: true })
-        .limit(1)
-        .maybeSingle();
+      try {
+        // 1. Group/channel batch jobs take priority and run to completion.
+        const { data: batchJob } = await supabase
+          .from("group_creation_queue")
+          .select("*")
+          .eq("status", "pending")
+          .in("type", ["group", "channel"])
+          .order("created_at", { ascending: true })
+          .limit(1)
+          .maybeSingle();
 
-      if (batchJob) {
-        await runBatchJob(batchJob);
-        continue;
+        if (batchJob) {
+          await runBatchJob(batchJob);
+          continue;
+        }
+
+        // 2. Bot jobs: pick the one due soonest (null next_attempt_at = never
+        //    served = go now). Round-robin falls out of ordering by next_attempt_at.
+        const { data: botJob } = await supabase
+          .from("group_creation_queue")
+          .select("*")
+          .eq("type", "bot")
+          .in("status", ["pending", "processing"])
+          .order("next_attempt_at", { ascending: true, nullsFirst: true })
+          .order("created_at", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (!botJob) return; // nothing left to do
+
+        const dueAt = botJob.next_attempt_at
+          ? new Date(botJob.next_attempt_at).getTime()
+          : 0;
+        const waitMs = dueAt - Date.now();
+        if (waitMs > 0) {
+          // Every remaining bot job is still cooling down — wait for the soonest.
+          await sleep(Math.min(waitMs, SCHEDULER_MAX_SLEEP_MS));
+          continue;
+        }
+
+        await runOneBotStep(botJob);
+        // Breather after disconnecting this account before moving to the next one.
+        await sleep(BOT_INTER_ACCOUNT_MS);
+      } catch (iterErr: any) {
+        broadcastLog({
+          message: `Queue iteration error (continuing): ${
+            iterErr?.message || "Unknown error"
+          }`,
+          type: "error",
+          timestamp: new Date().toISOString(),
+        });
+        // Brief pause so a persistent error (e.g. DB down) doesn't hot-loop; the
+        // periodic tick will keep retrying afterwards.
+        await sleep(5000);
       }
-
-      // 2. Bot jobs: pick the one due soonest (null next_attempt_at = never
-      //    served = go now). Round-robin falls out of ordering by next_attempt_at.
-      const { data: botJob } = await supabase
-        .from("group_creation_queue")
-        .select("*")
-        .eq("type", "bot")
-        .in("status", ["pending", "processing"])
-        .order("next_attempt_at", { ascending: true, nullsFirst: true })
-        .order("created_at", { ascending: true })
-        .limit(1)
-        .maybeSingle();
-
-      if (!botJob) return; // nothing left to do
-
-      const dueAt = botJob.next_attempt_at
-        ? new Date(botJob.next_attempt_at).getTime()
-        : 0;
-      const waitMs = dueAt - Date.now();
-      if (waitMs > 0) {
-        // Every remaining bot job is still cooling down — wait for the soonest.
-        await sleep(Math.min(waitMs, SCHEDULER_MAX_SLEEP_MS));
-        continue;
-      }
-
-      await runOneBotStep(botJob);
-      // Breather after disconnecting this account before moving to the next one.
-      await sleep(BOT_INTER_ACCOUNT_MS);
     }
   } catch (err: any) {
     broadcastLog({
@@ -382,23 +407,27 @@ async function processQueue() {
   }
 }
 
-// Run a group/channel batch job to completion (unchanged behavior).
+// Run a group/channel batch job to completion. Never throws: any failure is
+// recorded on the job row so the scheduler loop keeps draining other work.
 async function runBatchJob(job: any) {
-  await supabase
-    .from("group_creation_queue")
-    .update({ status: "processing", started_at: new Date().toISOString() })
-    .eq("id", job.id);
-
   const jobType: "group" | "channel" =
     job.type === "channel" ? "channel" : "group";
 
-  broadcastLog({
-    message: `Starting queued job #${job.id} for account ${job.phone} to create ${job.group_count} ${jobType}s`,
-    type: "info",
-    timestamp: new Date().toISOString(),
-  });
-
   try {
+    // Claim the job (pending → processing) INSIDE the try: if this update itself
+    // throws (transient DB error), we fall through to the catch and mark the job
+    // failed instead of letting the exception escape and kill the whole loop.
+    await supabase
+      .from("group_creation_queue")
+      .update({ status: "processing", started_at: new Date().toISOString() })
+      .eq("id", job.id);
+
+    broadcastLog({
+      message: `Starting queued job #${job.id} for account ${job.phone} to create ${job.group_count} ${jobType}s`,
+      type: "info",
+      timestamp: new Date().toISOString(),
+    });
+
     const result = await createGroups(
       job.phone,
       job.group_count,
@@ -599,6 +628,60 @@ async function runOneBotStep(job: any) {
   );
 }
 
+// Recover jobs stranded by a previous process death or a loop that crashed while
+// a job was mid-flight. Group/channel batch rows are the only ones with no other
+// recovery path (the scheduler only selects `pending` for them), so a row left in
+// `processing` is orphaned forever otherwise. We reset ONLY rows whose `started_at`
+// is older than a staleness window, so a genuinely in-flight job on a live loop is
+// never yanked back. Bot/messaging rows already self-heal (they select
+// `processing` too), so they need no reset here.
+//
+// The window must sit ABOVE the longest a job can legitimately stay `processing`
+// on a live loop: createGroupsInner waits out short flood waits inline (up to
+// ~1h), so a healthy job can hold `processing` for close to an hour. We use 2h so
+// recovery only ever touches genuinely dead rows. Jobs stranded by an earlier
+// crash carry an old `started_at`, so they're recovered on the first boot/tick.
+const ORPHAN_STALE_MS = Number(process.env.ORPHAN_STALE_MS) || 2 * 60 * 60 * 1000;
+
+async function recoverOrphanedJobs() {
+  try {
+    const cutoff = new Date(Date.now() - ORPHAN_STALE_MS).toISOString();
+    // Reset stale processing batch jobs back to pending. Include rows with a null
+    // started_at (claimed but never stamped) as a safety net.
+    const { data: reset, error } = await supabase
+      .from("group_creation_queue")
+      .update({ status: "pending", started_at: null })
+      .in("type", ["group", "channel"])
+      .eq("status", "processing")
+      .or(`started_at.is.null,started_at.lt.${cutoff}`)
+      .select("id");
+
+    if (error) {
+      broadcastLog({
+        message: `Orphan recovery query failed: ${error.message}`,
+        type: "error",
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+    if (reset && reset.length) {
+      broadcastLog({
+        message: `Recovered ${reset.length} stranded group/channel job(s) back to pending (job ids: ${reset
+          .map((r: any) => r.id)
+          .join(", ")}).`,
+        type: "info",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  } catch (err: any) {
+    broadcastLog({
+      message: `Orphan recovery error: ${err?.message || "Unknown error"}`,
+      type: "error",
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+
 // Export function to start the queue scheduler
 export function startQueueProcessor() {
   broadcastLog({
@@ -606,7 +689,18 @@ export function startQueueProcessor() {
     type: "info",
     timestamp: new Date().toISOString(),
   });
-  processQueue();
+  // Reconcile stranded jobs from a prior crash/restart, then kick the loop.
+  recoverOrphanedJobs().finally(() => processQueue());
+
+  // Self-healing tick: re-drain the queue on a fixed interval. This is the key
+  // safeguard — the loop is otherwise only started on boot and on enqueue, so any
+  // error that ended it (or a job parked for later) would sit untouched until the
+  // next enqueue. The tick also re-runs orphan recovery so a job stranded by a
+  // mid-flight crash is picked up without a redeploy. Cheap and idempotent:
+  // processQueue() returns immediately if a loop is already running.
+  setInterval(() => {
+    recoverOrphanedJobs().finally(() => processQueue());
+  }, QUEUE_TICK_MS).unref?.();
 }
 
 interface CreateGroupsResult {
@@ -1809,44 +1903,54 @@ async function processMessagingQueue() {
   try {
     // eslint-disable-next-line no-constant-condition
     while (true) {
-      // Only consider targets whose parent job is still active.
-      const { data: activeJobs } = await supabase
-        .from("messaging_jobs")
-        .select("id")
-        .eq("status", "active");
-      const ids = (activeJobs || []).map((j: any) => j.id);
-      if (!ids.length) return;
+      // Per-iteration guard: one transient failure or a throw from a round must
+      // never kill the whole scheduler and strand the rest of the targets.
+      try {
+        // Only consider targets whose parent job is still active.
+        const { data: activeJobs } = await supabase
+          .from("messaging_jobs")
+          .select("id")
+          .eq("status", "active");
+        const ids = (activeJobs || []).map((j: any) => j.id);
+        if (!ids.length) return;
 
-      const { data: target } = await supabase
-        .from("messaging_targets")
-        .select("*")
-        .in("job_id", ids)
-        .in("status", ["pending", "processing"])
-        .order("next_attempt_at", { ascending: true, nullsFirst: true })
-        .order("id", { ascending: true })
-        .limit(1)
-        .maybeSingle();
+        const { data: target } = await supabase
+          .from("messaging_targets")
+          .select("*")
+          .in("job_id", ids)
+          .in("status", ["pending", "processing"])
+          .order("next_attempt_at", { ascending: true, nullsFirst: true })
+          .order("id", { ascending: true })
+          .limit(1)
+          .maybeSingle();
 
-      if (!target) return; // nothing left to do
+        if (!target) return; // nothing left to do
 
-      const dueAt = target.next_attempt_at
-        ? new Date(target.next_attempt_at).getTime()
-        : 0;
-      const waitMs = dueAt - Date.now();
-      if (waitMs > 0) {
-        await sleep(Math.min(waitMs, SCHEDULER_MAX_SLEEP_MS));
-        continue;
+        const dueAt = target.next_attempt_at
+          ? new Date(target.next_attempt_at).getTime()
+          : 0;
+        const waitMs = dueAt - Date.now();
+        if (waitMs > 0) {
+          await sleep(Math.min(waitMs, SCHEDULER_MAX_SLEEP_MS));
+          continue;
+        }
+
+        const { data: job } = await supabase
+          .from("messaging_jobs")
+          .select("*")
+          .eq("id", target.job_id)
+          .single();
+        if (!job || job.status !== "active") continue;
+
+        await runOneMessagingRound(target, job);
+        await sleep(MESSAGING_INTER_ACCOUNT_MS);
+      } catch (iterErr: any) {
+        mlog(
+          `Messaging iteration error (continuing): ${iterErr?.message || "Unknown error"}`,
+          "error"
+        );
+        await sleep(5000);
       }
-
-      const { data: job } = await supabase
-        .from("messaging_jobs")
-        .select("*")
-        .eq("id", target.job_id)
-        .single();
-      if (!job || job.status !== "active") continue;
-
-      await runOneMessagingRound(target, job);
-      await sleep(MESSAGING_INTER_ACCOUNT_MS);
     }
   } catch (err: any) {
     mlog(`Error in messaging scheduler: ${err?.message || "Unknown error"}`, "error");
@@ -1855,9 +1959,13 @@ async function processMessagingQueue() {
   }
 }
 
-// Resume any in-flight messaging jobs on boot (drips can span days).
+// Resume any in-flight messaging jobs on boot (drips can span days), and keep a
+// self-healing tick so parked rounds and error-interrupted jobs are always
+// re-drained without waiting for a new enqueue. Idempotent: the call is a no-op
+// while a loop is already running.
 export function startMessagingProcessor() {
   processMessagingQueue();
+  setInterval(() => processMessagingQueue(), QUEUE_TICK_MS).unref?.();
 }
 
 // ----- Messaging endpoints -------------------------------------------------
