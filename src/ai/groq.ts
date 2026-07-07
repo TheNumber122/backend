@@ -1,12 +1,16 @@
-// Groq-backed generator for Telegram bot usernames. Handles are built from real,
-// common English words ending in "bot" — one word on the first attempt (a shot
-// at a clean single-word handle), a single/compound word on later attempts.
-// crypto mode prefixes "crypto". NO numbers, NO underscores. AI-only: there is
-// NO local fallback. If a batch is too small or fails, it re-asks Groq, passing
-// every handle already produced/rejected in the prompt so it returns fresh words.
+// Cerebras-backed generator for Telegram bot usernames. Handles are built from one
+// or two short, real, common English words ending in "bot"; crypto mode prefixes
+// "crypto", default mode is just the word(s) + "bot". NO numbers, NO underscores.
+// AI-only: there is NO local fallback. To fight repetition cheaply, each call
+// forces the first word to start with the next letter in a rotating consonant
+// sweep (counter-driven, not random) — so back-to-back batches can't cluster on
+// the same over-farmed words, and we spend no prompt tokens listing rejected names.
+//
+// Cerebras is OpenAI-compatible; we moved off Groq because its free tier ran out
+// of daily requests. Free tier here: 1M tokens/day, 30 req/min (reset 00:00 UTC).
 
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "llama-3.3-70b-versatile";
+const CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions";
+const CEREBRAS_MODEL = "gpt-oss-120b";
 
 type GenMode = "default" | "crypto" | "custom";
 
@@ -15,45 +19,40 @@ interface GenerateOpts {
   theme?: string; // custom-pattern theme, e.g. "must be about crypto"
   avoid?: string[]; // handles already tried this run (skip duplicates)
   mode?: GenMode; // 'crypto' forces start-with-"crypto", end-with bot/robot
-  // First-attempt only: ask for ONE short real word + "bot" (a shot at a rare,
-  // still-free single-word handle). Ignored for crypto (already one word after
-  // "crypto"). Later attempts drop this and allow natural compound words too.
-  singleWord?: boolean;
 }
 
 // How many extra candidates to request beyond `count`, so a few "username taken"
 // collisions are covered by a single AI call instead of many.
 const BUFFER = 5;
 
-// How many `avoid` entries actually get pasted into the prompt text. The full
-// avoid list still guarantees no duplicates in the OUTPUT (see the `skip` Set
-// in callGroqOnce, which always uses the complete list) — this cap only limits
-// how many tokens we spend narrating rejected names to the model, which was
-// the single biggest cost driver since that list grows every retry round.
-const MAX_AVOID_IN_PROMPT = 20;
+// NOTE: `avoid` is used ONLY to de-dupe the OUTPUT (the `skip` Set in
+// callCerebrasOnce) — it is deliberately NOT pasted into the prompt. The rotating
+// letter constraint (see nextLetter) spreads batches apart without spending
+// tokens narrating rejected names, which used to be the biggest cost driver.
 
 // Hard cap on the "word id" portion of the handle — i.e. everything except the
 // literal "crypto" prefix (crypto mode) and the "bot" suffix. Enforced here in
 // code, not just in the prompt, because the model doesn't always respect
 // length instructions (it sometimes truncates/glues words to force a fit,
 // e.g. "lanthem", "pilobot" — this cap + the sanitize check below stop that).
-const MAX_WORD_LEN = 7;
+const MAX_WORD_LEN = 8;
 const MIN_WORD_LEN = 3;
 
 function capitalizeFirst(s: string): string {
   return s.length ? s[0].toUpperCase() + s.slice(1) : s;
 }
 
-// Pick up to n random distinct items from a pool. Used to rotate the prompt
-// examples per call so the model doesn't keep anchoring on the same words.
-function pickSome<T>(pool: T[], n: number): T[] {
-  const copy = [...pool];
-  const out: T[] = [];
-  while (out.length < n && copy.length) {
-    const i = Math.floor(Math.random() * copy.length);
-    out.push(copy.splice(i, 1)[0]);
-  }
-  return out;
+// Counter-driven letter sweep: each Cerebras call forces the first word to start
+// with the next consonant here, so consecutive batches can't collide on the same
+// over-farmed words. Deterministic (not random) so we cover the space instead of
+// re-landing on the same cluster; vowels and q/x/y/z are dropped because too few
+// short, common words start with them.
+const START_LETTERS = "bcdfghjklmnprstvw".split("");
+let letterCursor = 0;
+function nextLetter(): string {
+  const letter = START_LETTERS[letterCursor % START_LETTERS.length];
+  letterCursor++;
+  return letter;
 }
 
 // Turn any model output into a clean, rule-compliant handle or null if unusable.
@@ -80,90 +79,38 @@ export function botDisplayName(username: string): string {
   return capitalizeFirst(username);
 }
 
-// How many times we re-ask Groq within one generateBotUsernames() call when a
+// How many times we re-ask Cerebras within one generateBotUsernames() call when a
 // batch comes back too small (duplicates/junk) or a transient API error hits.
 const MAX_ROUNDS = 4;
 
-// Build the user prompt for one Groq request. `avoid` lists every handle already
-// produced or rejected — it goes straight into the prompt so the model returns
-// fresh words instead of repeating names we can't use.
+// Build the user prompt for one Cerebras request. `letter` is the forced first-word
+// initial for this call (rotating sweep) — it steers the batch off the model's
+// default favorites without any example words or rejected-name lists, keeping the
+// prompt short.
 function buildUserPrompt(
   want: number,
-  avoid: string[],
   mode: GenMode,
-  theme?: string,
-  singleWord = false
+  letter: string,
+  theme?: string
 ): string {
   const themeLine =
     mode === "custom" && theme
       ? `The names should subtly evoke this theme: "${theme}". Keep them brandable, not literal.`
       : "";
-  const avoidForPrompt = avoid.slice(-MAX_AVOID_IN_PROMPT);
-  const avoidLine = avoidForPrompt.length
-    ? `Avoid these already-used names (or close variants): ${avoidForPrompt.join(", ")}.`
-    : "";
-
-  // All pools contain ONLY words that are 7 letters or fewer, so examples never
-  // contradict the length rule. Wide spread of categories, avoiding the
-  // "nature aesthetic" cliché that's already fished out on Telegram.
-  const singleWordDefaultPool = [
-    "Compassbot", "Beaconbot", "Harvestbot", "Vintagebot", "Rocketbot",
-    "Comedybot", "Marblebot", "Riddlebot", "Canyonbot", "Prairiebot",
-    "Oasisbot", "Miragebot", "Tailorbot", "Bakerbot", "Orbitbot",
-    "Rhythmbot", "Anthembot", "Choralbot", "Legendbot", "Puzzlebot",
-    "Rallybot", "Pilotbot", "Nomadbot", "Fablebot", "Velvetbot",
-    "Cinemabot", "Fusionbot", "Lagoonbot", "Cactusbot", "Palacebot",
-    "Lanternbot", "Saffronbot", "Gingerbot", "Cobaltbot", "Bronzebot",
-    "Jasperbot", "Cottonbot", "Violinbot", "Sonnetbot", "Cipherbot",
-  ];
-  // Real, single-word English compounds (already recognized as ONE dictionary
-  // word, not two words stuck together) plus short single words — this is what
-  // "not single-word" now means. It avoids asking the model to weld two
-  // separate words into a tiny budget, which is what produced junk like
-  // "lanthem" / "pilobot" / "hansebot" before.
-  const twoWordDefaultPool = [
-    "Gatewaybot", "Roadmapbot", "Outpostbot", "Kickoffbot", "Handoffbot",
-    "Checkupbot", "Toolboxbot", "Bellhopbot", "Postboxbot", "Logbookbot",
-    "Hallwaybot", "Walkwaybot", "Carpoolbot", "Payloadbot", "Landingbot",
-    "Rooftopbot",
-  ];
-  const singleWordCryptoPool = [
-    "CryptoPilotbot", "CryptoBakerbot", "CryptoOrbitbot", "CryptoRallybot",
-    "CryptoNomadbot", "CryptoFablebot", "CryptoAtlasbot", "CryptoCargobot",
-    "CryptoGlobebot", "CryptoJasperbot",
-  ];
-  const twoWordCryptoPool = [
-    "CryptoGatewaybot", "CryptoOutpostbot", "CryptoKickoffbot",
-    "CryptoToolboxbot", "CryptoPayloadbot", "CryptoRooftopbot",
-  ];
 
   const isCrypto = mode === "crypto";
-  const pool = isCrypto
-    ? singleWord
-      ? singleWordCryptoPool
-      : twoWordCryptoPool
-    : singleWord
-    ? singleWordDefaultPool
-    : twoWordDefaultPool;
+  const L = letter.toUpperCase();
 
   const shapeRule = isCrypto
-    ? singleWord
-      ? '- MUST start with "crypto", then EXACTLY ONE short real English word, then end with "bot"'
-      : '- MUST start with "crypto", then ONE real English word OR ONE natural English compound word (a word already recognized as a single dictionary word, like "gateway" or "toolbox" — NOT two separate words stuck together), then end with "bot"'
-    : singleWord
-    ? '- use EXACTLY ONE short real English word, then end with "bot"'
-    : '- use ONE real English word OR ONE natural English compound word (a word already recognized as a single dictionary word, like "gateway" or "toolbox" — NOT two separate words stuck together), then end with "bot"';
+    ? `- MUST start with "crypto", then one or two short real English words (the FIRST word starting with "${L}"), then end with "bot"`
+    : `- use one or two short real English words (the FIRST word starting with "${L}"), then end with "bot"`;
 
   const rules = [
     shapeRule,
-    `- word id (excl. "crypto"/"bot") must be ${MIN_WORD_LEN}-${MAX_WORD_LEN} letters; pick a shorter real word if it doesn't fit — never truncate or glue words together (no "lant", "pilobot", "hansebot")`,
-    "- every word = real, common, instantly-recognizable English dictionary word; no invented/obscure/archaic/foreign/scientific/abbreviated words",
-    "- mix categories across the batch (travel, professions, architecture, food/spice, music, materials, sport, everyday objects) — don't cluster on one",
-    "- avoid overused roots (nearly always taken): nature (oak, willow, cedar, ember, sand, stone, storm, river, moon, fox, wolf, raven, owl, dragon), elements/colors/metals (water, fire, ice, gold, silver, red, blue, iron, steel), status/hype words (king, boss, alpha, elite, prime, ultra, pro, ninja, cyber, tech)",
-    "- creativity check: if a word is a generic element/color/status noun, swap it for something more specific and distinctive",
-    "- lowercase a-z only, no numbers/underscores/spaces/symbols",
-    "- vary widely; don't reuse the examples below or cluster on one category",
-    `Examples (shape/length only, don't copy or stay in their category): ${pickSome(pool, 4).join(", ")}.`,
+    `- the word part (excluding "crypto"/"bot") must be ${MIN_WORD_LEN}-${MAX_WORD_LEN} letters total; if it won't fit, pick a shorter real word — never truncate or glue nonsense (no "lant", "pilobot")`,
+    "- only real, common, instantly-recognizable English words; nothing invented/obscure/foreign/scientific",
+    "- skip clichéd (already-taken) roots: nature, colors, metals, and hype words (king, boss, alpha, pro, cyber)",
+    "- lowercase a-z only; no numbers, underscores, spaces or symbols",
   ];
 
   return [
@@ -171,31 +118,30 @@ function buildUserPrompt(
     "Rules:",
     ...rules,
     themeLine,
-    avoidLine,
     'JSON only: {"usernames": ["...", "..."]}',
   ]
     .filter(Boolean)
     .join("\n");
 }
 
-// One Groq request. Returns clean, rule-compliant handles not in `avoid`.
+// One Cerebras request. Returns clean, rule-compliant handles not in `avoid`.
 // Throws on any network/API/parse error so the caller can retry — no fallback.
-async function callGroqOnce(
+async function callCerebrasOnce(
   key: string,
   want: number,
   avoid: string[],
   mode: GenMode,
-  theme?: string,
-  singleWord = false
+  theme?: string
 ): Promise<string[]> {
-  const res = await fetch(GROQ_URL, {
+  const letter = nextLetter();
+  const res = await fetch(CEREBRAS_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${key}`,
     },
     body: JSON.stringify({
-      model: GROQ_MODEL,
+      model: CEREBRAS_MODEL,
       temperature: 0.9,
       response_format: { type: "json_object" },
       messages: [
@@ -206,14 +152,14 @@ async function callGroqOnce(
         },
         {
           role: "user",
-          content: buildUserPrompt(want, avoid, mode, theme, singleWord),
+          content: buildUserPrompt(want, mode, letter, theme),
         },
       ],
     }),
   });
 
   if (!res.ok) {
-    throw new Error(`Groq HTTP ${res.status}`);
+    throw new Error(`Cerebras HTTP ${res.status}`);
   }
 
   const data: any = await res.json();
@@ -238,22 +184,22 @@ async function callGroqOnce(
 }
 
 export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]> {
-  const { count, theme, avoid = [], mode = "default", singleWord = false } = opts;
-  const key = process.env.GROQ_API_KEY;
+  const { count, theme, avoid = [], mode = "default" } = opts;
+  const key = process.env.CEREBRAS_API_KEY;
 
   // AI-only: with no key there is nothing to generate. Caller surfaces the error.
   if (!key) return [];
 
   // `seen` starts with the caller's avoid list (handles already rejected by
-  // BotFather this run) and grows every round, so each retry asks Groq for words
-  // it hasn't given us yet.
+  // BotFather this run) and grows every round, so each retry asks Cerebras for
+  // words it hasn't given us yet.
   const seen = new Set(avoid);
   const out: string[] = [];
 
   for (let round = 0; round < MAX_ROUNDS && out.length < count; round++) {
     const want = count - out.length + BUFFER;
     try {
-      const batch = await callGroqOnce(key, want, [...seen], mode, theme, singleWord);
+      const batch = await callCerebrasOnce(key, want, [...seen], mode, theme);
       for (const handle of batch) {
         if (!seen.has(handle)) {
           seen.add(handle);

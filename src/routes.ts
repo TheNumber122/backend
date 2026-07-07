@@ -1235,12 +1235,9 @@ async function createSingleBotInner(
         theme: usernameTheme,
         mode,
         avoid: rejected, // handles BotFather already refused this run
-        // First attempt: shoot for a rare single-word handle (crypto+word or one
-        // word). If that gets rejected, later rounds fall back to two words.
-        singleWord: round === 0,
       });
       if (candidates.length === 0) {
-        log(`No usernames generated for ${phone} (check GROQ_API_KEY / Groq status).`, "error");
+        log(`No usernames generated for ${phone} (check CEREBRAS_API_KEY / Cerebras status).`, "error");
         return { status: "error" };
       }
       const primary = candidates[0];
