@@ -1263,6 +1263,8 @@ async function createSingleBotInner(
           display_name: botDisplayName(primary),
           token: result.token,
           theme: mode === "custom" ? theme || null : mode === "crypto" ? "crypto" : null,
+          // Explicit source of truth for the default/crypto/custom split.
+          pattern: mode,
         });
         // Bumps both the total counter and the 3-per-24h daily counter atomically.
         await supabase.rpc("register_bot_creation", { account_phone: phone });
@@ -1452,6 +1454,37 @@ router.get("/accounts", async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Failed to fetch accounts" });
     }
 
+    // Tally each account's bots by pattern in a single query, so the bots page
+    // can tell which accounts still need default vs crypto bots (10 + 10 goal).
+    // `pattern` is the source of truth; fall back to the legacy `theme` marker
+    // for any row created before the column existed and not yet backfilled.
+    const { data: botRows } = await supabase
+      .from("telegram_bots")
+      .select("owner_phone, pattern, theme")
+      .eq("workspace", ws);
+
+    const botPatternCounts: Record<
+      string,
+      { default: number; crypto: number; custom: number }
+    > = {};
+    for (const row of botRows ?? []) {
+      const bucket = (botPatternCounts[row.owner_phone] ??= {
+        default: 0,
+        crypto: 0,
+        custom: 0,
+      });
+      const pattern =
+        row.pattern ??
+        (row.theme === "crypto"
+          ? "crypto"
+          : row.theme == null
+          ? "default"
+          : "custom");
+      if (pattern === "crypto") bucket.crypto += 1;
+      else if (pattern === "custom") bucket.custom += 1;
+      else bucket.default += 1;
+    }
+
     // For each account, call check_rate_limit AND check_bot_limits and merge the
     // result. Both RPCs reset their rolling 24h counter as a side effect once the
     // window elapses, so calling them on read keeps the dashboard fresh. Without
@@ -1492,6 +1525,9 @@ router.get("/accounts", async (req: Request, res: Response) => {
                 bots_count: account.bots_count || 0,
                 bots_created_24h: botsCreated24h,
                 bots_next_reset: botsNextReset,
+                default_bots_count: botPatternCounts[account.phone]?.default ?? 0,
+                crypto_bots_count: botPatternCounts[account.phone]?.crypto ?? 0,
+                custom_bots_count: botPatternCounts[account.phone]?.custom ?? 0,
                 groups_created_24h: account.groups_created_24h || 0,
                 next_available_time: effectiveAvailableTime,
                 rateLimitInfo: null,
@@ -1505,6 +1541,9 @@ router.get("/accounts", async (req: Request, res: Response) => {
               bots_count: account.bots_count || 0,
               bots_created_24h: botsCreated24h,
               bots_next_reset: botsNextReset,
+              default_bots_count: botPatternCounts[account.phone]?.default ?? 0,
+              crypto_bots_count: botPatternCounts[account.phone]?.crypto ?? 0,
+              custom_bots_count: botPatternCounts[account.phone]?.custom ?? 0,
               groups_created_24h:
                 (rateLimitInfo.groups_created_24h ??
                   account.groups_created_24h) ||

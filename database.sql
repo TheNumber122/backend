@@ -433,6 +433,10 @@ create table if not exists telegram_bots (
   display_name text,
   token text not null,                  -- BotFather HTTP API token
   theme text,                           -- custom-pattern theme, null for default
+  -- Which naming pattern produced this bot: 'default' | 'crypto' | 'custom'.
+  -- This is the source of truth for the per-account 10-default / 10-crypto split
+  -- shown on the bots page (never re-derive it from the username).
+  pattern text not null default 'default',
   created_at timestamptz not null default now()
 );
 
@@ -445,6 +449,29 @@ ON telegram_bots
 FOR ALL
 USING (true)
 WITH CHECK (true);
+
+-- Add the pattern column to pre-existing telegram_bots tables and backfill it
+-- from the historical `theme` convention (crypto bots stored theme='crypto',
+-- default bots theme=null, custom bots the actual theme text). Safe to re-run.
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'telegram_bots' and column_name = 'pattern'
+  ) then
+    alter table telegram_bots add column pattern text not null default 'default';
+    update telegram_bots
+    set pattern = case
+      when theme = 'crypto' then 'crypto'
+      when theme is null then 'default'
+      else 'custom'
+    end;
+  end if;
+end $$;
+
+-- Speeds up the per-account default/crypto/custom tally in GET /accounts.
+create index if not exists idx_telegram_bots_ws_owner_pattern
+  on telegram_bots (workspace, owner_phone, pattern);
 
 -- ===========================================================================
 -- Messaging feature: bulk-send to an account's EXISTING channels or groups.
