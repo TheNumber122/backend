@@ -1258,19 +1258,35 @@ async function createSingleBotInner(
       );
 
       if (result.ok) {
-        // Store what BotFather actually set as the name (from the primary handle).
-        await supabase.from("telegram_bots").insert({
-          workspace,
-          owner_phone: phone,
-          username: result.username,
-          display_name: botDisplayName(primary),
-          token: result.token,
-          theme: mode === "custom" ? theme || null : mode === "crypto" ? "crypto" : null,
-          // Explicit source of truth for the default/crypto/custom split.
-          pattern: mode,
+        // Best-effort save of the token/handle. Even if this fails, the bot DOES
+        // exist on Telegram, so we still count it below — the account counters
+        // (bumped by register_bot_creation), not this row, are the source of
+        // truth for the dashboard.
+        const { error: insertError } = await supabase
+          .from("telegram_bots")
+          .insert({
+            workspace,
+            owner_phone: phone,
+            username: result.username,
+            display_name: botDisplayName(primary),
+            token: result.token,
+            theme:
+              mode === "custom" ? theme || null : mode === "crypto" ? "crypto" : null,
+            pattern: mode,
+          });
+        if (insertError) {
+          // Surface it (the token may be lost) but do NOT skip the count.
+          log(
+            `WARNING: bot @${result.username} was created on Telegram for ${phone} but its row could not be saved (${insertError.message}). It is still counted.`,
+            "error"
+          );
+        }
+
+        // Bump total + daily counters AND the matching per-pattern counter.
+        await supabase.rpc("register_bot_creation", {
+          account_phone: phone,
+          bot_pattern: mode,
         });
-        // Bumps both the total counter and the 3-per-24h daily counter atomically.
-        await supabase.rpc("register_bot_creation", { account_phone: phone });
         // Log the handle only — never the raw token (the WS log is global).
         log(`Created bot @${result.username} for account ${phone}.`, "success");
         return { status: "created", username: result.username };
@@ -1447,7 +1463,7 @@ router.get("/accounts", async (req: Request, res: Response) => {
     const { data, error } = await supabase
       .from("telegram_accounts")
       .select(
-        "phone, username, groups_count, channels_count, bots_count, bots_created_24h, bots_next_reset, groups_created_24h, next_available_time, flood_wait_until"
+        "phone, username, groups_count, channels_count, bots_count, bots_created_24h, bots_next_reset, default_bots_count, crypto_bots_count, groups_created_24h, next_available_time, flood_wait_until"
       )
       .eq("workspace", ws)
       .order("phone", { ascending: true });
@@ -1455,43 +1471,6 @@ router.get("/accounts", async (req: Request, res: Response) => {
     if (error) {
       console.error("Supabase error:", error);
       return res.status(500).json({ error: "Failed to fetch accounts" });
-    }
-
-    // Tally each account's bots by pattern in a single query, so the bots page
-    // can tell which accounts still need default vs crypto bots (10 + 10 goal).
-    // Match by owner_phone, NOT by the bot row's workspace tag: bots_count is
-    // per-phone, but older bots were inserted under the job's workspace (often
-    // 'default'), so a workspace filter would undercount them and the tally
-    // would be smaller than "X/20 Bots". The phone is already workspace-owned
-    // via telegram_accounts above, so this stays isolated per user.
-    // `pattern` is the source of truth; fall back to the legacy `theme` marker
-    // for any row created before the column existed and not yet backfilled.
-    const accountPhones = (data ?? []).map((a) => a.phone);
-    const { data: botRows } = await supabase
-      .from("telegram_bots")
-      .select("owner_phone, pattern, theme")
-      .in("owner_phone", accountPhones);
-
-    const botPatternCounts: Record<
-      string,
-      { default: number; crypto: number; custom: number }
-    > = {};
-    for (const row of botRows ?? []) {
-      const bucket = (botPatternCounts[row.owner_phone] ??= {
-        default: 0,
-        crypto: 0,
-        custom: 0,
-      });
-      const pattern =
-        row.pattern ??
-        (row.theme === "crypto"
-          ? "crypto"
-          : row.theme == null
-          ? "default"
-          : "custom");
-      if (pattern === "crypto") bucket.crypto += 1;
-      else if (pattern === "custom") bucket.custom += 1;
-      else bucket.default += 1;
     }
 
     // For each account, call check_rate_limit AND check_bot_limits and merge the
@@ -1534,9 +1513,8 @@ router.get("/accounts", async (req: Request, res: Response) => {
                 bots_count: account.bots_count || 0,
                 bots_created_24h: botsCreated24h,
                 bots_next_reset: botsNextReset,
-                default_bots_count: botPatternCounts[account.phone]?.default ?? 0,
-                crypto_bots_count: botPatternCounts[account.phone]?.crypto ?? 0,
-                custom_bots_count: botPatternCounts[account.phone]?.custom ?? 0,
+                default_bots_count: account.default_bots_count || 0,
+                crypto_bots_count: account.crypto_bots_count || 0,
                 groups_created_24h: account.groups_created_24h || 0,
                 next_available_time: effectiveAvailableTime,
                 rateLimitInfo: null,
@@ -1550,9 +1528,8 @@ router.get("/accounts", async (req: Request, res: Response) => {
               bots_count: account.bots_count || 0,
               bots_created_24h: botsCreated24h,
               bots_next_reset: botsNextReset,
-              default_bots_count: botPatternCounts[account.phone]?.default ?? 0,
-              crypto_bots_count: botPatternCounts[account.phone]?.crypto ?? 0,
-              custom_bots_count: botPatternCounts[account.phone]?.custom ?? 0,
+              default_bots_count: account.default_bots_count || 0,
+              crypto_bots_count: account.crypto_bots_count || 0,
               groups_created_24h:
                 (rateLimitInfo.groups_created_24h ??
                   account.groups_created_24h) ||

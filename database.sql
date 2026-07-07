@@ -17,7 +17,13 @@ create table if not exists telegram_accounts (
   -- Rolling 24h bot-creation limit (max 3/day). bots_next_reset marks when the
   -- window (started on the first creation) resets bots_created_24h back to 0.
   bots_created_24h integer not null default 0,
-  bots_next_reset timestamptz
+  bots_next_reset timestamptz,
+  -- Per-pattern bot counters, bumped on every successful BotFather creation
+  -- (see register_bot_creation). These are the source of truth for the bots
+  -- page "X/10 default · Y/10 crypto" tally — independent of whether the
+  -- telegram_bots row saved — so the count always reflects reality.
+  default_bots_count integer not null default 0,
+  crypto_bots_count integer not null default 0
 );
 
 -- Enable RLS
@@ -227,6 +233,18 @@ begin
   ) then
     alter table telegram_accounts add column bots_next_reset timestamptz;
   end if;
+
+  -- Per-pattern bot counters. On first add, backfill default_bots_count from the
+  -- existing total (all historical bots were default) so accounts immediately
+  -- show the right split (e.g. an account with 8 bots -> 8 default).
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'telegram_accounts' and column_name = 'default_bots_count'
+  ) then
+    alter table telegram_accounts add column default_bots_count integer not null default 0;
+    alter table telegram_accounts add column crypto_bots_count integer not null default 0;
+    update telegram_accounts set default_bots_count = bots_count, crypto_bots_count = 0;
+  end if;
 end $$;
 
 -- Check both bot limits for an account, resetting the 24h window if it elapsed.
@@ -270,9 +288,14 @@ begin
 end;
 $$;
 
--- Record one successful bot creation: bump total + daily counters and start the
--- 24h window on the first creation (it does not slide on later creations).
-create or replace function register_bot_creation(account_phone text)
+-- Record one successful bot creation: bump total + daily counters, bump the
+-- matching per-pattern counter, and start the 24h window on the first creation
+-- (it does not slide on later creations). bot_pattern ∈ 'default'|'crypto'|
+-- 'custom'; custom bumps neither pattern counter (only the total).
+create or replace function register_bot_creation(
+  account_phone text,
+  bot_pattern text default 'default'
+)
 returns void
 language plpgsql
 as $$
@@ -280,7 +303,9 @@ begin
   update telegram_accounts
   set bots_count = bots_count + 1,
       bots_created_24h = bots_created_24h + 1,
-      bots_next_reset = coalesce(bots_next_reset, now() + interval '24 hours')
+      bots_next_reset = coalesce(bots_next_reset, now() + interval '24 hours'),
+      default_bots_count = default_bots_count + (case when bot_pattern = 'default' then 1 else 0 end),
+      crypto_bots_count = crypto_bots_count + (case when bot_pattern = 'crypto' then 1 else 0 end)
   where phone = account_phone;
 end;
 $$;

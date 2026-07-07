@@ -1,6 +1,7 @@
-// Groq-backed generator for Telegram bot usernames. Produces brandable handles
-// made of TWO real English words ending in "bot" (e.g. oceandriverbot,
-// cryptowormbot), with NO numbers and NO underscores. AI-only: there is NO local
+// Groq-backed generator for Telegram bot usernames. Handles are built from real,
+// common English words ending in "bot" — one word on the first attempt (a shot
+// at a clean single-word handle), two words on later attempts. crypto mode
+// prefixes "crypto". NO numbers, NO underscores. AI-only: there is NO local
 // fallback. If a batch is too small or fails, it re-asks Groq, passing every
 // handle already produced/rejected in the prompt so it returns fresh words.
 
@@ -78,73 +79,70 @@ function buildUserPrompt(
     ? `Do NOT output any of these already-used or rejected names (or close variants): ${avoid.join(", ")}.`
     : "";
 
-  // Example pools are rotated per call (a random few each time) so the model
-  // stops anchoring on the same handful of words and repeating itself.
-  const cryptoExamplePool = [
-    "CryptoWormbot", "CryptoFalconbot", "CryptoEmberbot", "CryptoHarborbot",
-    "CryptoNomadbot", "CryptoQuartzbot", "CryptoWillowbot", "CryptoRangerbot",
-    "CryptoLanternbot", "CryptoCometrobot",
+  // Four separate example pools — one per (mode × word-count) combination — so
+  // the shape hints never bleed across modes. Every example is a REAL, common,
+  // instantly-recognizable word; the model is told to match their realness, not
+  // copy them. A random few are shown per call so it stops anchoring.
+  const singleWordDefaultPool = [
+    "Falconbot", "Harborbot", "Willowbot", "Copperbot", "Thunderbot",
+    "Otterbot", "Lanternbot", "Emberbot", "Maplebot", "Meadowbot",
+    "Cobrabot", "Cedarbot", "Anchorbot", "Sparrowbot",
   ];
-  const defaultExamplePool = [
+  const twoWordDefaultPool = [
     "OceanDriverbot", "SilverFoxbot", "NightMarketbot", "IronPandabot",
     "VelvetRiverbot", "CopperLanternbot", "BraveOtterbot", "MapleThunderbot",
-    "AmberFalconbot", "FrostHarborbot", "LunarNomadbot", "CrimsonPilotbot",
+    "AmberFalconbot", "FrostHarborbot",
   ];
-  const singleWordExamplePool = [
-    "Zephyrbot", "Marlinbot", "Bramblebot", "Quiverbot", "Cinderbot",
-    "Halcyonbot", "Petrichorbot", "Wolframbot", "Lanternbot", "Nimbusbot",
+  const singleWordCryptoPool = [
+    "CryptoFalconbot", "CryptoHarborbot", "CryptoWillowbot", "CryptoEmberbot",
+    "CryptoNomadbot", "CryptoRangerbot", "CryptoLanternbot", "CryptoCopperbot",
+    "CryptoCedarbot", "CryptoOtterbot",
   ];
-  const cryptoTwoWordExamplePool = [
+  const twoWordCryptoPool = [
     "CryptoOceanDriverbot", "CryptoSilverFoxbot", "CryptoNightMarketbot",
     "CryptoIronPandabot", "CryptoVelvetRiverbot", "CryptoBraveOtterbot",
   ];
 
-  // Two dimensions: crypto vs default × single-word (first attempt) vs two-word
-  // (fallback). Single-word is the opener for BOTH modes — for crypto that's
-  // "crypto" + ONE word; the two-word fallback adds a second word.
-  const rules =
-    mode === "crypto"
-      ? singleWord
-        ? [
-            '- MUST start with "crypto", then ONE real English word, then end with "bot" or "robot"',
-            "- lowercase English letters a-z ONLY in the final output",
-            "- NO numbers, NO underscores, NO spaces, NO symbols",
-            "- 9 to 24 characters long",
-            '- the word after "crypto" must be a real, meaningful English word (not invented)',
-            "- prefer a rare, evocative word; vary widely and do NOT reuse the examples below",
-            `Format examples (for shape only, do NOT copy these words): ${pickSome(cryptoExamplePool, 3).join(", ")}.`,
-          ]
-        : [
-            '- MUST start with "crypto", then TWO real English words, then end with "bot" or "robot"',
-            "- lowercase English letters a-z ONLY in the final output",
-            "- NO numbers, NO underscores, NO spaces, NO symbols",
-            "- 12 to 24 characters long",
-            '- both words after "crypto" must be real, meaningful English words (not invented)',
-            "- combine unexpected word pairs for variety; do NOT reuse the examples below",
-            `Format examples (for shape only, do NOT copy these words): ${pickSome(cryptoTwoWordExamplePool, 3).join(", ")}.`,
-          ]
-      : singleWord
-        ? [
-            '- use exactly ONE uncommon but real English word, then end with the letters "bot"',
-            "- lowercase English letters a-z ONLY in the final output",
-            "- NO numbers, NO underscores, NO spaces, NO symbols",
-            "- 6 to 20 characters long",
-            "- pick rare, evocative, real words (not common ones, not invented gibberish)",
-            "- vary widely; do NOT reuse the example words below",
-            `Format examples (for shape only, do NOT copy these words): ${pickSome(singleWordExamplePool, 3).join(", ")}.`,
-          ]
-        : [
-            '- combine TWO real, meaningful English words, then end with the letters "bot"',
-            "- lowercase English letters a-z ONLY in the final output",
-            "- NO numbers, NO underscores, NO spaces, NO symbols",
-            "- 8 to 24 characters long",
-            "- both words must be real everyday English words (e.g. adjective + noun, or noun + noun)",
-            "- combine unexpected/unrelated word pairs for maximum variety; do NOT reuse the example words below",
-            `Format examples (for shape only, do NOT copy these words): ${pickSome(defaultExamplePool, 3).join(", ")}.`,
-          ];
+  const isCrypto = mode === "crypto";
+  const pool = isCrypto
+    ? singleWord
+      ? singleWordCryptoPool
+      : twoWordCryptoPool
+    : singleWord
+    ? singleWordDefaultPool
+    : twoWordDefaultPool;
+
+  // Exact shape for this (mode × single-word) combination.
+  const shapeRule = isCrypto
+    ? singleWord
+      ? '- MUST start with "crypto", then EXACTLY ONE real common English word, then end with "bot"'
+      : '- MUST start with "crypto", then EXACTLY TWO real common English words, then end with "bot"'
+    : singleWord
+    ? '- use EXACTLY ONE real, common English word, then end with "bot"'
+    : '- combine EXACTLY TWO real, common English words, then end with "bot"';
+
+  const lengthRule = isCrypto
+    ? singleWord
+      ? "- 9 to 22 characters long"
+      : "- 12 to 24 characters long"
+    : singleWord
+    ? "- 6 to 18 characters long"
+    : "- 8 to 22 characters long";
+
+  const rules = [
+    shapeRule,
+    "- EVERY word must be a real, common English word found in a normal dictionary",
+    "- use words a regular person instantly knows: animals, nature, colors, everyday objects, common adjectives",
+    "- ABSOLUTELY NO invented, made-up, obscure, archaic, foreign, scientific, or abbreviated words (e.g. no 'garr', 'cors', 'lumen', 'vesta', 'sylvan')",
+    "- lowercase a-z ONLY in the final output; NO numbers, underscores, spaces or symbols",
+    lengthRule,
+    "- vary the words widely; do NOT reuse the example words below",
+    `Real-word examples (for shape + realness only, do NOT copy these): ${pickSome(pool, 4).join(", ")}.`,
+  ];
 
   return [
     `Generate ${want} unique Telegram bot usernames.`,
+    "Every username must be built ONLY from real, common English dictionary words that an average person would recognize.",
     "Strict rules:",
     ...rules,
     themeLine,
@@ -173,13 +171,13 @@ async function callGroqOnce(
     },
     body: JSON.stringify({
       model: GROQ_MODEL,
-      temperature: 1.05,
+      temperature: 0.9,
       response_format: { type: "json_object" },
       messages: [
         {
           role: "system",
           content:
-            "You invent brandable Telegram bot usernames. You output strict JSON only.",
+            "You build Telegram bot usernames using ONLY real, common English dictionary words — never invented, obscure, or made-up words. You output strict JSON only.",
         },
         {
           role: "user",
