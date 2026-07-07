@@ -14,6 +14,10 @@ interface GenerateOpts {
   theme?: string; // custom-pattern theme, e.g. "must be about crypto"
   avoid?: string[]; // handles already tried this run (skip duplicates)
   mode?: GenMode; // 'crypto' forces start-with-"crypto", end-with bot/robot
+  // First-attempt only: ask for ONE uncommon word + "bot" (a shot at a rare,
+  // still-free single-word handle). Ignored for crypto (already one word after
+  // "crypto"). Later attempts drop this and use the two-word system.
+  singleWord?: boolean;
 }
 
 // How many extra candidates to request beyond `count`, so a few "username taken"
@@ -63,7 +67,8 @@ function buildUserPrompt(
   want: number,
   avoid: string[],
   mode: GenMode,
-  theme?: string
+  theme?: string,
+  singleWord = false
 ): string {
   const themeLine =
     mode === "custom" && theme
@@ -85,27 +90,58 @@ function buildUserPrompt(
     "VelvetRiverbot", "CopperLanternbot", "BraveOtterbot", "MapleThunderbot",
     "AmberFalconbot", "FrostHarborbot", "LunarNomadbot", "CrimsonPilotbot",
   ];
+  const singleWordExamplePool = [
+    "Zephyrbot", "Marlinbot", "Bramblebot", "Quiverbot", "Cinderbot",
+    "Halcyonbot", "Petrichorbot", "Wolframbot", "Lanternbot", "Nimbusbot",
+  ];
+  const cryptoTwoWordExamplePool = [
+    "CryptoOceanDriverbot", "CryptoSilverFoxbot", "CryptoNightMarketbot",
+    "CryptoIronPandabot", "CryptoVelvetRiverbot", "CryptoBraveOtterbot",
+  ];
 
+  // Two dimensions: crypto vs default × single-word (first attempt) vs two-word
+  // (fallback). Single-word is the opener for BOTH modes — for crypto that's
+  // "crypto" + ONE word; the two-word fallback adds a second word.
   const rules =
     mode === "crypto"
-      ? [
-          '- MUST start with "crypto", then ONE real English word, then end with "bot" or "robot"',
-          "- lowercase English letters a-z ONLY in the final output",
-          "- NO numbers, NO underscores, NO spaces, NO symbols",
-          "- 9 to 24 characters long",
-          '- the word after "crypto" must be a real, meaningful English word (not invented)',
-          "- vary the words widely; do NOT reuse the example words below",
-          `Format examples (for shape only, do NOT copy these words): ${pickSome(cryptoExamplePool, 3).join(", ")}.`,
-        ]
-      : [
-          '- combine TWO real, meaningful English words, then end with the letters "bot"',
-          "- lowercase English letters a-z ONLY in the final output",
-          "- NO numbers, NO underscores, NO spaces, NO symbols",
-          "- 8 to 24 characters long",
-          "- both words must be real everyday English words (e.g. adjective + noun, or noun + noun)",
-          "- combine unexpected/unrelated word pairs for maximum variety; do NOT reuse the example words below",
-          `Format examples (for shape only, do NOT copy these words): ${pickSome(defaultExamplePool, 3).join(", ")}.`,
-        ];
+      ? singleWord
+        ? [
+            '- MUST start with "crypto", then ONE real English word, then end with "bot" or "robot"',
+            "- lowercase English letters a-z ONLY in the final output",
+            "- NO numbers, NO underscores, NO spaces, NO symbols",
+            "- 9 to 24 characters long",
+            '- the word after "crypto" must be a real, meaningful English word (not invented)',
+            "- prefer a rare, evocative word; vary widely and do NOT reuse the examples below",
+            `Format examples (for shape only, do NOT copy these words): ${pickSome(cryptoExamplePool, 3).join(", ")}.`,
+          ]
+        : [
+            '- MUST start with "crypto", then TWO real English words, then end with "bot" or "robot"',
+            "- lowercase English letters a-z ONLY in the final output",
+            "- NO numbers, NO underscores, NO spaces, NO symbols",
+            "- 12 to 24 characters long",
+            '- both words after "crypto" must be real, meaningful English words (not invented)',
+            "- combine unexpected word pairs for variety; do NOT reuse the examples below",
+            `Format examples (for shape only, do NOT copy these words): ${pickSome(cryptoTwoWordExamplePool, 3).join(", ")}.`,
+          ]
+      : singleWord
+        ? [
+            '- use exactly ONE uncommon but real English word, then end with the letters "bot"',
+            "- lowercase English letters a-z ONLY in the final output",
+            "- NO numbers, NO underscores, NO spaces, NO symbols",
+            "- 6 to 20 characters long",
+            "- pick rare, evocative, real words (not common ones, not invented gibberish)",
+            "- vary widely; do NOT reuse the example words below",
+            `Format examples (for shape only, do NOT copy these words): ${pickSome(singleWordExamplePool, 3).join(", ")}.`,
+          ]
+        : [
+            '- combine TWO real, meaningful English words, then end with the letters "bot"',
+            "- lowercase English letters a-z ONLY in the final output",
+            "- NO numbers, NO underscores, NO spaces, NO symbols",
+            "- 8 to 24 characters long",
+            "- both words must be real everyday English words (e.g. adjective + noun, or noun + noun)",
+            "- combine unexpected/unrelated word pairs for maximum variety; do NOT reuse the example words below",
+            `Format examples (for shape only, do NOT copy these words): ${pickSome(defaultExamplePool, 3).join(", ")}.`,
+          ];
 
   return [
     `Generate ${want} unique Telegram bot usernames.`,
@@ -126,7 +162,8 @@ async function callGroqOnce(
   want: number,
   avoid: string[],
   mode: GenMode,
-  theme?: string
+  theme?: string,
+  singleWord = false
 ): Promise<string[]> {
   const res = await fetch(GROQ_URL, {
     method: "POST",
@@ -142,9 +179,12 @@ async function callGroqOnce(
         {
           role: "system",
           content:
-            "You invent brandable, two-word Telegram bot usernames. You output strict JSON only.",
+            "You invent brandable Telegram bot usernames. You output strict JSON only.",
         },
-        { role: "user", content: buildUserPrompt(want, avoid, mode, theme) },
+        {
+          role: "user",
+          content: buildUserPrompt(want, avoid, mode, theme, singleWord),
+        },
       ],
     }),
   });
@@ -175,7 +215,7 @@ async function callGroqOnce(
 }
 
 export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]> {
-  const { count, theme, avoid = [], mode = "default" } = opts;
+  const { count, theme, avoid = [], mode = "default", singleWord = false } = opts;
   const key = process.env.GROQ_API_KEY;
 
   // AI-only: with no key there is nothing to generate. Caller surfaces the error.
@@ -190,7 +230,7 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
   for (let round = 0; round < MAX_ROUNDS && out.length < count; round++) {
     const want = count - out.length + BUFFER;
     try {
-      const batch = await callGroqOnce(key, want, [...seen], mode, theme);
+      const batch = await callGroqOnce(key, want, [...seen], mode, theme, singleWord);
       for (const handle of batch) {
         if (!seen.has(handle)) {
           seen.add(handle);

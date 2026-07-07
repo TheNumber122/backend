@@ -1235,6 +1235,9 @@ async function createSingleBotInner(
         theme: usernameTheme,
         mode,
         avoid: rejected, // handles BotFather already refused this run
+        // First attempt: shoot for a rare single-word handle (crypto+word or one
+        // word). If that gets rejected, later rounds fall back to two words.
+        singleWord: round === 0,
       });
       if (candidates.length === 0) {
         log(`No usernames generated for ${phone} (check GROQ_API_KEY / Groq status).`, "error");
@@ -1456,12 +1459,18 @@ router.get("/accounts", async (req: Request, res: Response) => {
 
     // Tally each account's bots by pattern in a single query, so the bots page
     // can tell which accounts still need default vs crypto bots (10 + 10 goal).
+    // Match by owner_phone, NOT by the bot row's workspace tag: bots_count is
+    // per-phone, but older bots were inserted under the job's workspace (often
+    // 'default'), so a workspace filter would undercount them and the tally
+    // would be smaller than "X/20 Bots". The phone is already workspace-owned
+    // via telegram_accounts above, so this stays isolated per user.
     // `pattern` is the source of truth; fall back to the legacy `theme` marker
     // for any row created before the column existed and not yet backfilled.
+    const accountPhones = (data ?? []).map((a) => a.phone);
     const { data: botRows } = await supabase
       .from("telegram_bots")
       .select("owner_phone, pattern, theme")
-      .eq("workspace", ws);
+      .in("owner_phone", accountPhones);
 
     const botPatternCounts: Record<
       string,
