@@ -79,28 +79,33 @@ function buildUserPrompt(
     ? `Do NOT output any of these already-used or rejected names (or close variants): ${avoid.join(", ")}.`
     : "";
 
-  // Four separate example pools — one per (mode × word-count) combination — so
-  // the shape hints never bleed across modes. Every example is a REAL, common,
-  // instantly-recognizable word; the model is told to match their realness, not
-  // copy them. A random few are shown per call so it stops anchoring.
+  // Broad, cross-category pools. Deliberately avoid the "tree/weather/generic
+  // animal + bot" cliché (oak, willow, cedar, ember, storm, fox, raven...) —
+  // that vocabulary is the most fished-out on Telegram and collides constantly.
+  // These pull from: journeys, professions, food/spice, architecture, music,
+  // space, textures/materials, abstract nouns, sport, tools.
   const singleWordDefaultPool = [
-    "Falconbot", "Harborbot", "Willowbot", "Copperbot", "Thunderbot",
-    "Otterbot", "Lanternbot", "Emberbot", "Maplebot", "Meadowbot",
-    "Cobrabot", "Cedarbot", "Anchorbot", "Sparrowbot",
+    "Marathonbot", "Compassbot", "Beaconbot", "Harvestbot", "Blizzardbot",
+    "Vintagebot", "Turbobot", "Rocketbot", "Diamondbot", "Velvetbot",
+    "Cinemabot", "Fusionbot", "Orbitbot", "Comedybot", "Festivalbot",
+    "Marblebot", "Voyagebot", "Riddlebot", "Chroniclebot", "Fortressbot",
+    "Lagoonbot", "Glacierbot", "Cactusbot", "Nebulabot", "Canyonbot",
+    "Prairiebot", "Oasisbot", "Miragebot", "Tailorbot", "Bakerbot",
   ];
   const twoWordDefaultPool = [
-    "OceanDriverbot", "SilverFoxbot", "NightMarketbot", "IronPandabot",
-    "VelvetRiverbot", "CopperLanternbot", "BraveOtterbot", "MapleThunderbot",
-    "AmberFalconbot", "FrostHarborbot",
+    "GoldenCompassbot", "SilentRocketbot", "MarathonWizardbot", "VelvetComedybot",
+    "CosmicHarvestbot", "PrismVoyagebot", "IronTailorbot", "AmberFortressbot",
+    "CopperCanyonbot", "SilverOasisbot", "BraveNomadbot", "QuietGlacierbot",
+    "RoyalCactusbot", "HiddenLagoonbot", "SwiftPilotbot",
   ];
   const singleWordCryptoPool = [
-    "CryptoFalconbot", "CryptoHarborbot", "CryptoWillowbot", "CryptoEmberbot",
-    "CryptoNomadbot", "CryptoRangerbot", "CryptoLanternbot", "CryptoCopperbot",
-    "CryptoCedarbot", "CryptoOtterbot",
+    "CryptoMarathonbot", "CryptoCompassbot", "CryptoBeaconbot", "CryptoHarvestbot",
+    "CryptoVoyagebot", "CryptoOrbitbot", "CryptoFusionbot", "CryptoNebulabot",
+    "CryptoRiddlebot", "CryptoTailorbot",
   ];
   const twoWordCryptoPool = [
-    "CryptoOceanDriverbot", "CryptoSilverFoxbot", "CryptoNightMarketbot",
-    "CryptoIronPandabot", "CryptoVelvetRiverbot", "CryptoBraveOtterbot",
+    "CryptoGoldenCompassbot", "CryptoSilentRocketbot", "CryptoMarathonWizardbot",
+    "CryptoIronTailorbot", "CryptoAmberFortressbot", "CryptoCopperCanyonbot",
   ];
 
   const isCrypto = mode === "crypto";
@@ -132,12 +137,13 @@ function buildUserPrompt(
   const rules = [
     shapeRule,
     "- EVERY word must be a real, common English word found in a normal dictionary",
-    "- use words a regular person instantly knows: animals, nature, colors, everyday objects, common adjectives",
+    "- pull from a WIDE mix of categories so results don't cluster: journeys/exploration (voyage, compass, pioneer, nomad), professions (tailor, baker, pilot, sculptor), architecture (fortress, palace, lantern, archway), food & spice (cinnamon, saffron, honey, ginger), music (rhythm, anthem, chorus, echo), space (orbit, comet, nebula, satellite), textures/materials (velvet, marble, glass, brass), sport & games (marathon, riddle, puzzle, rally), abstract/story words (chronicle, legend, saga, fable) — mix categories across the batch instead of leaning on one",
     "- ABSOLUTELY NO invented, made-up, obscure, archaic, foreign, scientific, or abbreviated words (e.g. no 'garr', 'cors', 'lumen', 'vesta', 'sylvan')",
+    "- AVOID overused 'nature aesthetic' bot-name roots — these are almost always already taken, so do NOT use: oak, willow, cedar, maple, ember, meadow, storm, frost, forest, river, ocean, mountain, sky, cloud, moon, sun, star, wolf, fox, raven, owl, bear, eagle, hawk, tiger, lion, panda, otter, dragon, phoenix, ninja, pixel, cyber, tech, smart, quick, super, mega, ultra, pro",
     "- lowercase a-z ONLY in the final output; NO numbers, underscores, spaces or symbols",
     lengthRule,
-    "- vary the words widely; do NOT reuse the example words below",
-    `Real-word examples (for shape + realness only, do NOT copy these): ${pickSome(pool, 4).join(", ")}.`,
+    "- vary the words widely across the whole batch; do NOT reuse the example words below, and do NOT let every entry come from the same category",
+    `Shape/realness examples only (do NOT copy these, do NOT stick to their category): ${pickSome(pool, 4).join(", ")}.`,
   ];
 
   return [
@@ -177,7 +183,7 @@ async function callGroqOnce(
         {
           role: "system",
           content:
-            "You build Telegram bot usernames using ONLY real, common English dictionary words — never invented, obscure, or made-up words. You output strict JSON only.",
+            "You build Telegram bot usernames using ONLY real, common English dictionary words — never invented, obscure, or made-up words. You deliberately avoid clichéd 'nature aesthetic' naming (tree/weather/generic-animal words like oak, willow, cedar, ember, meadow, storm, frost, raven, fox) since those are almost always already taken — you pull from a wide spread of everyday vocabulary categories instead. You output strict JSON only.",
         },
         {
           role: "user",
