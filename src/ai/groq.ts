@@ -1,6 +1,6 @@
 // Cerebras-backed generator for Telegram bot usernames. Handles are built from one
 // or two short, real, common English words ending in "bot"; crypto mode prefixes
-// "crypto", default mode is just the word(s) + "bot". NO numbers, NO underscores.
+// "crypto", default mode is one word + "bot". NO numbers, NO underscores.
 // AI-only: there is NO local fallback. To fight repetition cheaply, each call
 // forces the first word to start with the next letter in a rotating consonant
 // sweep (counter-driven, not random) — so back-to-back batches can't cluster on
@@ -103,7 +103,7 @@ function buildUserPrompt(
 
   const shapeRule = isCrypto
     ? `- MUST start with "crypto", then one or two short real English words (the FIRST word starting with "${L}"), then end with "bot"`
-    : `- use one or two short real English words (the FIRST word starting with "${L}"), then end with "bot"`;
+    : `- use EXACTLY ONE short real English word (starting with "${L}"), then end with "bot"`;
 
   const rules = [
     shapeRule,
@@ -211,5 +211,58 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
     }
   }
 
+  return out;
+}
+
+// Cross-job candidate pool + known-taken set, both process-lifetime and in-memory
+// (no DB — free Render tier). One Cerebras call yields BATCH names but a single
+// bot only consumes a few, so the leftovers are parked in `pool` for the next
+// bot/job instead of burning another request. `tried` remembers every handle
+// already sent to BotFather this process so no later job re-attempts a name we
+// know is taken — the exact repetition seen in the logs.
+const BATCH = 15;
+const pool: Record<string, string[]> = {};
+const tried = new Set<string>();
+
+function poolKey(mode: GenMode, theme?: string): string {
+  return mode === "custom" ? `custom:${theme ?? ""}` : mode;
+}
+
+// Record handles BotFather has already seen (taken/invalid/used) so they're never
+// handed out again this process.
+export function markTried(handles: string[]): void {
+  for (const h of handles) tried.add(h);
+  // ponytail: crude cap; one run rarely nears this. Persist to Supabase only if
+  // cross-restart memory is ever needed.
+  if (tried.size > 5000) tried.clear();
+}
+
+// Draw `count` usable handles, refilling the shared pool BATCH-at-a-time. Draws
+// cost no API call until the pool runs dry.
+export async function getBotUsernames(
+  count: number,
+  opts: { mode?: GenMode; theme?: string; avoid?: string[] }
+): Promise<string[]> {
+  const { mode = "default", theme, avoid = [] } = opts;
+  const buf = (pool[poolKey(mode, theme)] ??= []);
+  const skip = new Set([...avoid, ...tried]);
+  const out: string[] = [];
+
+  while (out.length < count) {
+    while (buf.length && out.length < count) {
+      const h = buf.shift()!;
+      if (!skip.has(h)) {
+        skip.add(h);
+        out.push(h);
+      }
+    }
+    if (out.length >= count) break;
+
+    const fresh = await generateBotUsernames({ count: BATCH, mode, theme, avoid: [...skip] });
+    const usable = fresh.filter((h) => !skip.has(h));
+    if (!usable.length) break; // API down/empty or nothing new — return what we have
+    buf.push(...usable);
+    if (buf.length > BATCH * 2) buf.length = BATCH * 2; // ponytail: cap parked names
+  }
   return out;
 }

@@ -14,7 +14,7 @@ import {
 import { supabase, protectedDb } from "./db/supabase";
 import { broadcastLog } from "./broadcast";
 import { getWorkspace } from "./workspace";
-import { generateBotUsernames, botDisplayName } from "./ai/groq";
+import { getBotUsernames, markTried, botDisplayName } from "./ai/groq";
 import { createBotViaBotFather } from "./telegram/botfather";
 import { listChatsForAccount, TargetKind } from "./telegram/dialogs";
 import { sendToChat, SendContent } from "./telegram/send";
@@ -1220,18 +1220,17 @@ async function createSingleBotInner(
       );
     }
 
-    // Each AI call yields a primary handle plus a few spares (buffer), so a
-    // single /newbot cycle can absorb "username taken" collisions. If BotFather
-    // rejects EVERY candidate, we re-ask the AI for brand-new words, passing the
-    // rejected handles so it won't repeat them — no local fallback.
+    // getBotUsernames draws from a shared, batched pool so most bots cost no API
+    // call (leftovers from an earlier generation are reused across jobs). A single
+    // /newbot cycle sends up to 6 candidates to absorb "username taken" collisions;
+    // if BotFather rejects EVERY one, we draw fresh handles for another round.
     const MAX_USERNAME_ROUNDS = 3;
     const rejected: string[] = [];
     let lastReason: SingleBotResult["status"] = "no_username";
     let lastRetryAfterMs: number | undefined;
 
     for (let round = 0; round < MAX_USERNAME_ROUNDS; round++) {
-      const candidates = await generateBotUsernames({
-        count: 1,
+      const candidates = await getBotUsernames(6, {
         theme: usernameTheme,
         mode,
         avoid: rejected, // handles BotFather already refused this run
@@ -1253,6 +1252,9 @@ async function createSingleBotInner(
         candidates.slice(0, 6),
         log
       );
+      // Every handle BotFather saw (taken/invalid or the winner) is now used —
+      // stop any later job from re-attempting it.
+      markTried(result.tried);
 
       if (result.ok) {
         // Best-effort save of the token/handle. Even if this fails, the bot DOES
