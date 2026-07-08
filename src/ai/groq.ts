@@ -1,6 +1,7 @@
-// Cerebras-backed generator for Telegram bot usernames. Handles are built from one
-// or two short, real, common English words ending in "bot"; crypto mode prefixes
-// "crypto", default mode is one word + "bot". NO numbers, NO underscores.
+// Cerebras-backed generator for Telegram bot usernames. Default mode invents one
+// short, pronounceable made-up word + "bot" (e.g. cariovobot) so handles aren't
+// pre-taken; crypto mode prefixes "crypto" onto real English words + bot/robot.
+// NO numbers, NO underscores.
 // AI-only: there is NO local fallback. To fight repetition cheaply, each call
 // forces the first word to start with the next letter in a rotating consonant
 // sweep (counter-driven, not random) — so back-to-back batches can't cluster on
@@ -103,18 +104,23 @@ function buildUserPrompt(
 
   const shapeRule = isCrypto
     ? `- MUST start with "crypto", then one or two short real English words (the FIRST word starting with "${L}"), then end with "bot"`
-    : `- use EXACTLY ONE short real English word (starting with "${L}"), then end with "bot"`;
+    : `- invent EXACTLY ONE short made-up word (starting with "${L}"), then end with "bot" — like cariovobot, nasionobot, unibopbot`;
+
+  const wordKindRule = isCrypto
+    ? "- only real, common, instantly-recognizable English words; nothing invented/obscure/foreign/scientific"
+    : "- the word MUST be invented (not a real English word), but smooth and easily pronounceable — alternate consonants and vowels, no letter clusters, no random gibberish";
 
   const rules = [
     shapeRule,
-    `- the word part (excluding "crypto"/"bot") must be ${MIN_WORD_LEN}-${MAX_WORD_LEN} letters total; if it won't fit, pick a shorter real word — never truncate or glue nonsense (no "lant", "pilobot")`,
-    "- only real, common, instantly-recognizable English words; nothing invented/obscure/foreign/scientific",
-    "- skip clichéd (already-taken) roots: nature, colors, metals, and hype words (king, boss, alpha, pro, cyber)",
+    `- the word part (excluding "crypto"/"bot") must be ${MIN_WORD_LEN}-${MAX_WORD_LEN} letters total; if it won't fit, shorten it — keep it pronounceable, never glue on stray consonants`,
+    wordKindRule,
     "- lowercase a-z only; no numbers, underscores, spaces or symbols",
   ];
 
   return [
-    `Generate ${want} unique Telegram bot usernames from real, common English words.`,
+    isCrypto
+      ? `Generate ${want} unique Telegram bot usernames from real, common English words.`
+      : `Generate ${want} unique Telegram bot usernames from invented, pronounceable made-up words.`,
     "Rules:",
     ...rules,
     themeLine,
@@ -148,7 +154,9 @@ async function callCerebrasOnce(
         {
           role: "system",
           content:
-            `You build Telegram bot usernames using only real, common, distinctive English dictionary words — never invented/obscure words, never a word truncated or glued to hit a length limit, never a generic cliché root (nature words, elements, colors, metals, status/hype words like king/boss/alpha/elite). Word id (excluding any "crypto" prefix and "bot" suffix) is always ${MIN_WORD_LEN}-${MAX_WORD_LEN} letters. Output strict JSON only.`,
+            mode === "crypto"
+              ? `You build Telegram bot usernames using only real, common, distinctive English dictionary words — never invented/obscure words, never a word truncated or glued to hit a length limit, never a generic cliché root (nature words, elements, colors, metals, status/hype words like king/boss/alpha/elite). Word id (excluding any "crypto" prefix and "bot" suffix) is always ${MIN_WORD_LEN}-${MAX_WORD_LEN} letters. Output strict JSON only.`
+              : `You build Telegram bot usernames from invented, made-up words — NOT real English words (real words are already taken). Each word must be smooth and easily pronounceable, alternating consonants and vowels (like cariovo, nasiono, unibop), never random letter gibberish. Word id (excluding the "bot" suffix) is always ${MIN_WORD_LEN}-${MAX_WORD_LEN} letters. Output strict JSON only.`,
         },
         {
           role: "user",
