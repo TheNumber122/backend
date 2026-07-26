@@ -403,6 +403,8 @@ async function processQueue() {
         }
 
         // 1b. Bot deletion jobs: same priority as batch jobs, run to completion.
+        //     Honor next_attempt_at so a flood-parked job isn't re-picked in a
+        //     hot loop — if it's not due yet, fall through; the tick retries it.
         const { data: deleteJob } = await supabase
           .from("group_creation_queue")
           .select("*")
@@ -413,8 +415,13 @@ async function processQueue() {
           .maybeSingle();
 
         if (deleteJob) {
-          await runBotDeleteJob(deleteJob);
-          continue;
+          const deleteDueAt = deleteJob.next_attempt_at
+            ? new Date(deleteJob.next_attempt_at).getTime()
+            : 0;
+          if (deleteDueAt <= Date.now()) {
+            await runBotDeleteJob(deleteJob);
+            continue;
+          }
         }
 
         // 2. Bot jobs: pick the one due soonest (null next_attempt_at = never
@@ -739,6 +746,10 @@ async function runBotDeleteJob(job: any) {
   }
 
   let client: any = null;
+  // Hold the account lock for the whole job: without it the messaging scheduler
+  // can bring another account online mid-conversation, whose getClientByPhone →
+  // clearAllSessionsExcept destroys OUR client ("Client is destroyed" crash).
+  await withAccountLock(async () => {
   try {
     client = await getClientByPhone(job.phone);
 
@@ -841,6 +852,7 @@ async function runBotDeleteJob(job: any) {
       try { await clearSession(job.phone); } catch { /* ignore */ }
     }
   }
+  });
 }
 
 // Recover jobs stranded by a previous process death or a loop that crashed while
@@ -2016,29 +2028,36 @@ router.get("/bots", async (req: Request, res: Response) => {
 //   • confirm — creates queue job(s) to delete matched bots via BotFather
 // ===========================================================================
 
+// Fetch ALL workspace bots (supabase caps a single select at 1000 rows, so we
+// page through) and keep those whose token's numeric bot ID exceeds threshold.
+async function fetchBotsAboveThreshold(ws: string, threshold: number) {
+  const PAGE = 1000;
+  const all: any[] = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase
+      .from("telegram_bots")
+      .select("id, username, display_name, owner_phone, token, pattern, created_at")
+      .eq("workspace", ws)
+      .order("id")
+      .range(from, from + PAGE - 1);
+    if (error) throw new Error(error.message);
+    all.push(...(data || []));
+    if (!data || data.length < PAGE) break;
+  }
+  return all
+    .map((b: any) => ({ ...b, bot_id: parseInt((b.token || "").split(":")[0], 10) }))
+    .filter((b: any) => Number.isFinite(b.bot_id) && b.bot_id > threshold);
+}
+
 // POST /bots/delete/preview — show which bots would be deleted
 router.post("/bots/delete/preview", async (req: Request, res: Response) => {
   try {
     const ws = getWorkspace(req);
     const threshold = Number(req.body.threshold) || 854;
 
-    const { data: bots, error } = await supabase
-      .from("telegram_bots")
-      .select("id, username, display_name, owner_phone, token, pattern, created_at")
-      .eq("workspace", ws);
-
-    if (error) {
-      return res.status(500).json({ success: false, error: error.message });
-    }
-
-    // Parse token to extract numeric bot ID and filter by threshold
-    const matched = (bots || [])
-      .map((b: any) => {
-        const botId = parseInt((b.token || "").split(":")[0], 10);
-        return { ...b, bot_id: botId };
-      })
-      .filter((b: any) => Number.isFinite(b.bot_id) && b.bot_id > threshold)
-      .sort((a: any, b: any) => a.bot_id - b.bot_id);
+    const matched = (await fetchBotsAboveThreshold(ws, threshold)).sort(
+      (a: any, b: any) => a.bot_id - b.bot_id
+    );
 
     // Group by owner_phone
     const groupedByOwner: Record<string, any[]> = {};
@@ -2075,23 +2094,15 @@ router.post("/bots/delete/confirm", async (req: Request, res: Response) => {
   try {
     const ws = getWorkspace(req);
     const threshold = Number(req.body.threshold) || 854;
+    // Owners the user removed from the purge in the preview UI.
+    const excluded = new Set<string>(
+      Array.isArray(req.body.excludePhones) ? req.body.excludePhones : []
+    );
 
-    const { data: bots, error } = await supabase
-      .from("telegram_bots")
-      .select("id, username, owner_phone, token, pattern")
-      .eq("workspace", ws);
-
-    if (error) {
-      return res.status(500).json({ success: false, error: error.message });
-    }
-
-    // Same filter as preview
-    const matched = (bots || [])
-      .map((b: any) => {
-        const botId = parseInt((b.token || "").split(":")[0], 10);
-        return { ...b, bot_id: botId };
-      })
-      .filter((b: any) => Number.isFinite(b.bot_id) && b.bot_id > threshold);
+    // Same paged fetch + filter as preview
+    const matched = (await fetchBotsAboveThreshold(ws, threshold)).filter(
+      (b: any) => !excluded.has(b.owner_phone || "unknown")
+    );
 
     if (!matched.length) {
       return res.status(400).json({ success: false, error: "No bots matched the threshold." });

@@ -200,8 +200,9 @@ export async function createBotViaBotFather(
 //   5. Click button containing "Yes" → done
 //
 // Inline buttons are clicked via client.getCallbackAnswer() (user-only method).
-// BotFather doesn't always answer callback queries, so we use fireAndForget
-// and rely on waitForResponse to get the next message.
+// BotFather doesn't always answer callback queries, so we use fireAndForget.
+// After a click BotFather usually EDITS the menu message in place rather than
+// sending a new one, so we race waitForNewMessage against waitForEdit.
 // ---------------------------------------------------------------------------
 
 export type DeleteBotResult =
@@ -248,6 +249,17 @@ function getInlineButtons(msg: any): any[][] {
   return [];
 }
 
+// After clicking an inline button, BotFather either edits the menu message in
+// place or (rarely) sends a new one. Race both; first settled wins. The loser's
+// eventual rejection is swallowed so it can't crash the process.
+function waitForNextStep(conv: any, editOf: any): Promise<any> {
+  const swallow = (p: Promise<any>) => { p.catch(() => {}); return p; };
+  return Promise.race([
+    swallow(conv.waitForNewMessage(undefined, STEP_TIMEOUT)),
+    swallow(conv.waitForEdit(undefined, { message: editOf?.id, timeout: STEP_TIMEOUT })),
+  ]);
+}
+
 export async function deleteBotViaBotFather(
   client: any,
   botUsername: string, // without @
@@ -275,7 +287,7 @@ export async function deleteBotViaBotFather(
       // Step 3: Click on the bot
       log(`BotFather → click @${botUsername}`);
       await clickInlineButton(client, listMsg, botBtn);
-      reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+      reply = await waitForNextStep(conv, listMsg);
       log(`BotFather ⇐ ${short(reply.text)}`);
 
       // Step 4: Click "Delete Bot"
@@ -287,7 +299,7 @@ export async function deleteBotViaBotFather(
 
       log("BotFather → click Delete Bot");
       await clickInlineButton(client, reply, deleteBtn);
-      reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+      reply = await waitForNextStep(conv, reply);
       log(`BotFather ⇐ ${short(reply.text)}`);
 
       // Step 5: First confirmation — find button containing "Yes"
@@ -299,7 +311,7 @@ export async function deleteBotViaBotFather(
 
       log(`BotFather → click "${yesBtn.text}"`);
       await clickInlineButton(client, reply, yesBtn);
-      reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+      reply = await waitForNextStep(conv, reply);
       log(`BotFather ⇐ ${short(reply.text)}`);
 
       // Step 6: Second confirmation — find button containing "Yes"
@@ -311,7 +323,7 @@ export async function deleteBotViaBotFather(
 
       log(`BotFather → click "${yesBtn.text}"`);
       await clickInlineButton(client, reply, yesBtn);
-      reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+      reply = await waitForNextStep(conv, reply);
       log(`BotFather ⇐ ${short(reply.text)}`);
 
       // Check if deletion was successful
@@ -375,8 +387,7 @@ async function findBotInList(
 
     log(`BotFather → click » (page ${page + 2})`);
     await clickInlineButton(client, reply, nextBtn);
-    await sleep(2000);
-    reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+    reply = await waitForNextStep(conv, reply);
     log(`BotFather ⇐ ${short(reply.text)}`);
   }
   return null;

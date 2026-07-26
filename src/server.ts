@@ -13,6 +13,13 @@ import http from "http";
 import WebSocket from "ws";
 import { setWebSocketClients, broadcastLog } from "./broadcast";
 
+// mtcute can reject internal promises after a client is destroyed mid-operation
+// (e.g. session torn down while a conversation is in flight). Without this, one
+// stray rejection kills the whole process and strands every queued job.
+process.on("unhandledRejection", (reason) => {
+  console.error("[Telegap] Unhandled rejection (continuing):", reason);
+});
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:3001";
