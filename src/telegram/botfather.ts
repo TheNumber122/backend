@@ -1,4 +1,4 @@
-import { Conversation } from "@mtcute/node";
+import { Conversation, BotKeyboard } from "@mtcute/node";
 
 // Automates @BotFather over a user session to create a bot. One call = one
 // /newbot cycle. Because BotFather keeps asking for a username after a rejected
@@ -187,4 +187,197 @@ export async function createBotViaBotFather(
     log(`BotFather: conversation error — ${message}`, "error");
     return { ok: false, reason: "error", message, tried };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Mass bot deletion via BotFather conversation.
+//
+// Flow:
+//   1. /mybots → list of bots (inline keyboard, 6 per page)
+//   2. Click the target bot → action menu
+//   3. Click "Delete Bot" → first confirmation
+//   4. Click button containing "Yes" → second confirmation
+//   5. Click button containing "Yes" → done
+//
+// Inline buttons are clicked via client.getCallbackAnswer() (user-only method).
+// BotFather doesn't always answer callback queries, so we use fireAndForget
+// and rely on waitForResponse to get the next message.
+// ---------------------------------------------------------------------------
+
+export type DeleteBotResult =
+  | { ok: true }
+  | { ok: false; reason: "not_found" | "flood" | "timeout" | "error"; message: string };
+
+// Find a callback button whose text contains `substring` (case-insensitive).
+function findButtonContaining(
+  buttons: any[][],
+  substring: string
+): any | null {
+  for (const row of buttons) {
+    for (const btn of row) {
+      if (
+        btn._ === "keyboardButtonCallback" &&
+        typeof btn.text === "string" &&
+        btn.text.toLowerCase().includes(substring.toLowerCase())
+      ) {
+        return btn;
+      }
+    }
+  }
+  return null;
+}
+
+// Click an inline button via getCallbackAnswer, fire-and-forget style.
+async function clickInlineButton(client: any, msg: any, btn: any): Promise<void> {
+  try {
+    await client.getCallbackAnswer({
+      message: msg,
+      data: btn.data,
+      fireAndForget: true,
+      timeout: 10000,
+    });
+  } catch {
+    // Fire-and-forget: errors are non-fatal, we wait for the next message anyway.
+  }
+}
+
+// Safely extract inline keyboard buttons from a message's markup.
+function getInlineButtons(msg: any): any[][] {
+  const m = msg?.markup;
+  if (m && m.type === "inline" && Array.isArray(m.buttons)) return m.buttons;
+  return [];
+}
+
+export async function deleteBotViaBotFather(
+  client: any,
+  botUsername: string, // without @
+  log: LogFn
+): Promise<DeleteBotResult> {
+  const conv = new Conversation(client, BOTFATHER);
+  const usernameLower = botUsername.toLowerCase();
+
+  try {
+    return await conv.with(async () => {
+      // Step 1: /mybots
+      log("BotFather → /mybots");
+      await conv.sendText("/mybots");
+      let reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+      log(`BotFather ⇐ ${short(reply.text)}`);
+
+      // Step 2: Find the bot in the list (paginate if needed)
+      const found = await findBotInList(client, conv, reply, usernameLower, log);
+      if (!found) {
+        return { ok: false, reason: "not_found", message: `@${botUsername} not found in /mybots list` };
+      }
+
+      const { msg: listMsg, btn: botBtn } = found;
+
+      // Step 3: Click on the bot
+      log(`BotFather → click @${botUsername}`);
+      await clickInlineButton(client, listMsg, botBtn);
+      reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+      log(`BotFather ⇐ ${short(reply.text)}`);
+
+      // Step 4: Click "Delete Bot"
+      const deleteBtn = findButtonContaining(getInlineButtons(reply), "Delete Bot");
+      if (!deleteBtn) {
+        log("BotFather: could not find 'Delete Bot' button in action menu", "error");
+        return { ok: false, reason: "error", message: "Delete Bot button not found" };
+      }
+
+      log("BotFather → click Delete Bot");
+      await clickInlineButton(client, reply, deleteBtn);
+      reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+      log(`BotFather ⇐ ${short(reply.text)}`);
+
+      // Step 5: First confirmation — find button containing "Yes"
+      let yesBtn = findButtonContaining(getInlineButtons(reply), "Yes");
+      if (!yesBtn) {
+        log("BotFather: could not find 'Yes' button in first confirmation", "error");
+        return { ok: false, reason: "error", message: "First confirmation button not found" };
+      }
+
+      log(`BotFather → click "${yesBtn.text}"`);
+      await clickInlineButton(client, reply, yesBtn);
+      reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+      log(`BotFather ⇐ ${short(reply.text)}`);
+
+      // Step 6: Second confirmation — find button containing "Yes"
+      yesBtn = findButtonContaining(getInlineButtons(reply), "Yes");
+      if (!yesBtn) {
+        log("BotFather: could not find 'Yes' button in second confirmation", "error");
+        return { ok: false, reason: "error", message: "Second confirmation button not found" };
+      }
+
+      log(`BotFather → click "${yesBtn.text}"`);
+      await clickInlineButton(client, reply, yesBtn);
+      reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+      log(`BotFather ⇐ ${short(reply.text)}`);
+
+      // Check if deletion was successful
+      const replyText = (reply.text || "").toLowerCase();
+      if (replyText.includes("deleted") || replyText.includes("done") || replyText.includes("success")) {
+        log(`Bot @${botUsername} deleted successfully.`, "success");
+        return { ok: true };
+      }
+
+      // Could be a flood or unexpected response
+      if (/too many attempts|try again|flood/.test(replyText)) {
+        const retryAfter = parseRetrySeconds(reply.text);
+        log(`BotFather flood during deletion: ${reply.text}`, "error");
+        return { ok: false, reason: "flood", message: reply.text };
+      }
+
+      // Assume success if BotFather responded with something non-error
+      log(`Bot @${botUsername} deletion completed.`, "success");
+      return { ok: true };
+    });
+  } catch (err: any) {
+    const message = String(err?.message || err);
+    if (isTimeoutErr(err)) {
+      log(`BotFather: timed out during deletion of @${botUsername} — ${message}`, "error");
+      return { ok: false, reason: "timeout", message };
+    }
+    log(`BotFather: deletion error for @${botUsername} — ${message}`, "error");
+    return { ok: false, reason: "error", message };
+  }
+}
+
+// Search through /mybots pages to find the target bot.
+// Handles pagination via the "»" button.
+async function findBotInList(
+  client: any,
+  conv: any,
+  reply: any,
+  usernameLower: string,
+  log: LogFn
+): Promise<{ msg: any; btn: any } | null> {
+  for (let page = 0; page < 10; page++) {
+    const buttons = getInlineButtons(reply);
+    if (buttons.length) {
+      // Check each button for the target username
+      for (const row of buttons) {
+        for (const btn of row) {
+          if (
+            btn._ === "keyboardButtonCallback" &&
+            typeof btn.text === "string" &&
+            btn.text.toLowerCase().includes(usernameLower)
+          ) {
+            return { msg: reply, btn };
+          }
+        }
+      }
+    }
+
+    // Not found on this page — try clicking "»" for next page
+    const nextBtn = findButtonContaining(buttons, "»");
+    if (!nextBtn) return null; // no more pages
+
+    log(`BotFather → click » (page ${page + 2})`);
+    await clickInlineButton(client, reply, nextBtn);
+    await sleep(2000);
+    reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+    log(`BotFather ⇐ ${short(reply.text)}`);
+  }
+  return null;
 }

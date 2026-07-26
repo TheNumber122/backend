@@ -15,7 +15,7 @@ import { supabase, protectedDb } from "./db/supabase";
 import { broadcastLog } from "./broadcast";
 import { getWorkspace } from "./workspace";
 import { getBotUsernames, markTried, botDisplayName } from "./ai/groq";
-import { createBotViaBotFather } from "./telegram/botfather";
+import { createBotViaBotFather, deleteBotViaBotFather } from "./telegram/botfather";
 import { listChatsForAccount, TargetKind } from "./telegram/dialogs";
 import { sendToChat, SendContent } from "./telegram/send";
 import { generateBroadcastMessages } from "./ai/messages";
@@ -402,6 +402,21 @@ async function processQueue() {
           continue;
         }
 
+        // 1b. Bot deletion jobs: same priority as batch jobs, run to completion.
+        const { data: deleteJob } = await supabase
+          .from("group_creation_queue")
+          .select("*")
+          .eq("type", "bot_delete")
+          .in("status", ["pending", "processing"])
+          .order("created_at", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (deleteJob) {
+          await runBotDeleteJob(deleteJob);
+          continue;
+        }
+
         // 2. Bot jobs: pick the one due soonest (null next_attempt_at = never
         //    served = go now). Round-robin falls out of ordering by next_attempt_at.
         const { data: botJob } = await supabase
@@ -681,6 +696,151 @@ async function runOneBotStep(job: any) {
       `Retrying in ${human}. [${newFailures}/${MAX_BOT_FAILURES} failures]`,
     "error"
   );
+}
+
+// ---------------------------------------------------------------------------
+// Bot deletion job: delete bots one-by-one via BotFather conversation.
+// Each job targets one owner account and a list of bot usernames stored as
+// JSON in the job's `description` column. Progress is tracked via `bots_done`.
+// 30s delay between deletions. Never throws — failures are recorded on the job.
+// ---------------------------------------------------------------------------
+const BOT_DELETE_DELAY_MS = 30 * 1000; // 30s between deletions
+
+async function runBotDeleteJob(job: any) {
+  const log = (message: string, type: "info" | "success" | "error" = "info") =>
+    broadcastLog({ message, type, timestamp: new Date().toISOString() });
+
+  const nowIso = () => new Date().toISOString();
+  const usernames: string[] = (() => {
+    try { return JSON.parse(job.description || "[]"); }
+    catch { return []; }
+  })();
+  const total = job.group_count || usernames.length;
+  const alreadyDone = job.bots_done ?? 0;
+
+  if (!usernames.length) {
+    await supabase
+      .from("group_creation_queue")
+      .update({ status: "completed", completed_at: nowIso() })
+      .eq("id", job.id);
+    return;
+  }
+
+  // Claim the job
+  if (job.status === "pending") {
+    await supabase
+      .from("group_creation_queue")
+      .update({ status: "processing", started_at: nowIso() })
+      .eq("id", job.id);
+    log(
+      `Starting bot deletion job #${job.id} for ${job.phone}: ${total} bot(s)` +
+      (alreadyDone > 0 ? ` (resuming from ${alreadyDone})` : "")
+    );
+  }
+
+  let client: any = null;
+  try {
+    client = await getClientByPhone(job.phone);
+
+    // Verify session
+    try {
+      const me = await client.getMe();
+      log(`Account ${job.phone} online as @${me?.username ?? me?.firstName ?? "unknown"}.`);
+    } catch (meErr: any) {
+      log(`Session invalid for ${job.phone} (${meErr?.message || meErr}); recreating...`, "error");
+      await clearSession(job.phone);
+      client = await getClientByPhone(job.phone);
+    }
+
+    // Start updates loop for BotFather conversation
+    try { await client.startUpdatesLoop(); } catch { /* may already be running */ }
+
+    // Delete bots starting from where we left off
+    for (let i = alreadyDone; i < usernames.length; i++) {
+      const username = usernames[i];
+
+      // Check for cancellation every bot
+      const { data: fresh } = await supabase
+        .from("group_creation_queue")
+        .select("status")
+        .eq("id", job.id)
+        .single();
+      if (fresh && fresh.status !== "processing") {
+        log(`Deletion job #${job.id} cancelled mid-run.`);
+        return;
+      }
+
+      log(`Deleting bot @${username} (${i + 1}/${total})...`);
+      const result = await deleteBotViaBotFather(client, username, log);
+
+      if (result.ok) {
+        // Delete from telegram_bots table
+        const { data: botRow } = await supabase
+          .from("telegram_bots")
+          .select("pattern")
+          .eq("username", username)
+          .eq("owner_phone", job.phone)
+          .single();
+
+        await supabase
+          .from("telegram_bots")
+          .delete()
+          .eq("username", username)
+          .eq("owner_phone", job.phone);
+
+        // Decrement counters
+        const pattern = botRow?.pattern || "default";
+        await supabase.rpc("register_bot_deletion", {
+          account_phone: job.phone,
+          bot_pattern: pattern,
+        });
+      } else if (result.reason === "flood") {
+        // Park the job and retry later
+        const retryAfter = 15 * 60 * 1000; // 15 min default
+        const nextAt = new Date(Date.now() + retryAfter).toISOString();
+        await supabase
+          .from("group_creation_queue")
+          .update({ bots_done: i, next_attempt_at: nextAt, status: "processing" })
+          .eq("id", job.id);
+        log(
+          `Flood during deletion of @${username} — parking for ~15 min. (${i}/${total} done)`,
+          "error"
+        );
+        return; // will resume on next tick
+      } else {
+        // timeout / error / not_found — log and continue with next bot
+        log(`Failed to delete @${username}: ${result.reason} — skipping.`, "error");
+      }
+
+      // Update progress
+      await supabase
+        .from("group_creation_queue")
+        .update({ bots_done: i + 1 })
+        .eq("id", job.id);
+
+      // Delay between deletions (skip after last)
+      if (i < usernames.length - 1) {
+        await sleep(BOT_DELETE_DELAY_MS);
+      }
+    }
+
+    // All done
+    await supabase
+      .from("group_creation_queue")
+      .update({ status: "completed", completed_at: nowIso() })
+      .eq("id", job.id);
+    log(`Bot deletion job #${job.id} complete — ${total} bot(s) processed.`, "success");
+  } catch (err: any) {
+    await supabase
+      .from("group_creation_queue")
+      .update({ status: "failed", completed_at: nowIso(), error_message: err?.message || "Unknown error" })
+      .eq("id", job.id);
+    log(`Bot deletion job #${job.id} failed: ${err?.message || "Unknown error"}`, "error");
+  } finally {
+    if (client) {
+      try { await clearSession(job.phone); } catch { /* ignore */ }
+    }
+  }
 }
 
 // Recover jobs stranded by a previous process death or a loop that crashed while
@@ -1847,6 +2007,167 @@ router.get("/bots", async (req: Request, res: Response) => {
     return res
       .status(500)
       .json({ success: false, error: err.message || "Failed to fetch bots" });
+  }
+});
+
+// ===========================================================================
+// MASS BOT DELETION
+//   • preview — returns all bots with token ID > threshold, grouped by owner
+//   • confirm — creates queue job(s) to delete matched bots via BotFather
+// ===========================================================================
+
+// POST /bots/delete/preview — show which bots would be deleted
+router.post("/bots/delete/preview", async (req: Request, res: Response) => {
+  try {
+    const ws = getWorkspace(req);
+    const threshold = Number(req.body.threshold) || 854;
+
+    const { data: bots, error } = await supabase
+      .from("telegram_bots")
+      .select("id, username, display_name, owner_phone, token, pattern, created_at")
+      .eq("workspace", ws);
+
+    if (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    // Parse token to extract numeric bot ID and filter by threshold
+    const matched = (bots || [])
+      .map((b: any) => {
+        const botId = parseInt((b.token || "").split(":")[0], 10);
+        return { ...b, bot_id: botId };
+      })
+      .filter((b: any) => Number.isFinite(b.bot_id) && b.bot_id > threshold)
+      .sort((a: any, b: any) => a.bot_id - b.bot_id);
+
+    // Group by owner_phone
+    const groupedByOwner: Record<string, any[]> = {};
+    for (const bot of matched) {
+      const phone = bot.owner_phone || "unknown";
+      if (!groupedByOwner[phone]) groupedByOwner[phone] = [];
+      groupedByOwner[phone].push(bot);
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        bots: matched.map((b: any) => ({
+          username: b.username,
+          bot_id: b.bot_id,
+          owner_phone: b.owner_phone,
+          display_name: b.display_name,
+          pattern: b.pattern,
+          created_at: b.created_at,
+        })),
+        totalCount: matched.length,
+        groupedByOwner,
+      },
+    });
+  } catch (err: any) {
+    return res
+      .status(500)
+      .json({ success: false, error: err?.message || "Preview failed" });
+  }
+});
+
+// POST /bots/delete/confirm — create deletion queue jobs
+router.post("/bots/delete/confirm", async (req: Request, res: Response) => {
+  try {
+    const ws = getWorkspace(req);
+    const threshold = Number(req.body.threshold) || 854;
+
+    const { data: bots, error } = await supabase
+      .from("telegram_bots")
+      .select("id, username, owner_phone, token, pattern")
+      .eq("workspace", ws);
+
+    if (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    // Same filter as preview
+    const matched = (bots || [])
+      .map((b: any) => {
+        const botId = parseInt((b.token || "").split(":")[0], 10);
+        return { ...b, bot_id: botId };
+      })
+      .filter((b: any) => Number.isFinite(b.bot_id) && b.bot_id > threshold);
+
+    if (!matched.length) {
+      return res.status(400).json({ success: false, error: "No bots matched the threshold." });
+    }
+
+    // Group by owner_phone — one queue job per owner (each needs its own account session)
+    const groupedByOwner: Record<string, any[]> = {};
+    for (const bot of matched) {
+      const phone = bot.owner_phone || "unknown";
+      if (!groupedByOwner[phone]) groupedByOwner[phone] = [];
+      groupedByOwner[phone].push(bot);
+    }
+
+    const jobIds: number[] = [];
+
+    for (const [ownerPhone, ownerBots] of Object.entries(groupedByOwner)) {
+      // Verify the owner account exists in this workspace
+      const { data: account } = await supabase
+        .from("telegram_accounts")
+        .select("phone")
+        .eq("phone", ownerPhone)
+        .eq("workspace", ws)
+        .single();
+
+      if (!account) {
+        broadcastLog({
+          message: `Skipping ${ownerBots.length} bot(s) — owner account ${ownerPhone} not found in workspace.`,
+          type: "error",
+          timestamp: new Date().toISOString(),
+        });
+        continue;
+      }
+
+      const usernames = ownerBots.map((b) => b.username);
+
+      const { data: job, error: jobError } = await supabase
+        .from("group_creation_queue")
+        .insert({
+          phone: ownerPhone,
+          workspace: ws,
+          group_count: usernames.length,
+          naming_pattern: String(threshold),
+          description: JSON.stringify(usernames),
+          type: "bot_delete",
+          status: "pending",
+          bots_done: 0,
+          created_at: new Date().toISOString(),
+        })
+        .select()
+        .single();
+
+      if (jobError) {
+        broadcastLog({
+          message: `Failed to create deletion job for ${ownerPhone}: ${jobError.message}`,
+          type: "error",
+          timestamp: new Date().toISOString(),
+        });
+        continue;
+      }
+
+      jobIds.push(job.id);
+      broadcastLog({
+        message: `Deletion job #${job.id} created for ${ownerPhone}: ${usernames.length} bot(s) to delete.`,
+        type: "info",
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Kick the queue processor
+    processQueue();
+
+    return res.json({ success: true, data: { job_ids: jobIds, totalJobs: jobIds.length } });
+  } catch (err: any) {
+    return res
+      .status(500)
+      .json({ success: false, error: err?.message || "Failed to create deletion jobs" });
   }
 });
 

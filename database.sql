@@ -335,6 +335,32 @@ begin
 end;
 $$;
 
+-- Record one successful bot deletion: decrement total + per-pattern counters.
+-- bot_pattern ∈ 'default'|'crypto'|'custom'; custom decrements neither pattern
+-- counter (only the total). All counters are floored at 0 to prevent negatives.
+create or replace function register_bot_deletion(
+  account_phone text,
+  bot_pattern text default 'default'
+)
+returns void
+language plpgsql
+as $$
+begin
+  update telegram_accounts
+  set bots_count = greatest(bots_count - 1, 0),
+      bots_created_24h = greatest(bots_created_24h - 1, 0),
+      default_bots_count = default_bots_count - (case when bot_pattern = 'default' then 1 else 0 end),
+      crypto_bots_count = crypto_bots_count - (case when bot_pattern = 'crypto' then 1 else 0 end)
+  where phone = account_phone;
+
+  -- Floor per-pattern counters at 0
+  update telegram_accounts
+  set default_bots_count = greatest(default_bots_count, 0),
+      crypto_bots_count = greatest(crypto_bots_count, 0)
+  where phone = account_phone;
+end;
+$$;
+
 -- Add migration for first_creation_time if it exists
 do $$ 
 begin
