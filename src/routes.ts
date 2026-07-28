@@ -2702,8 +2702,164 @@ router.delete("/messaging/jobs/:id", async (req: Request, res: Response) => {
       .eq("id", id);
     cleanupJobImage(job);
     return res.json({ success: true, message: `Job ${id} cancelled.` });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err?.message || "Unexpected error." });
+    }
+  });
+
+// GET /stats/overall — aggregate stats across ALL workspaces (admin/overview view)
+router.get("/stats/overall", async (_req: Request, res: Response) => {
+  try {
+    // Accounts across all workspaces
+    const { data: accounts, error: accError } = await supabase
+      .from("telegram_accounts")
+      .select("phone, username, groups_count, channels_count, bots_count, bots_created_24h, bots_next_reset, default_bots_count, crypto_bots_count, groups_created_24h, next_available_time, flood_wait_until");
+    if (accError) throw accError;
+
+    // Bots across all workspaces
+    const { data: bots, error: botError } = await supabase
+      .from("telegram_bots")
+      .select("id, username, display_name, owner_phone, theme, created_at");
+    if (botError) throw botError;
+
+    // Queue jobs across all workspaces
+    const { data: queue, error: queueError } = await supabase
+      .from("group_creation_queue")
+      .select("*")
+      .order("created_at", { ascending: false });
+    if (queueError) throw queueError;
+
+    // Messaging jobs across all workspaces
+    const { data: jobs, error: jobsError } = await supabase
+      .from("messaging_jobs")
+      .select("*, targets:messaging_targets(*)")
+      .order("created_at", { ascending: false });
+    if (jobsError) throw jobsError;
+
+    // Compute aggregates
+    const channels = accounts?.reduce((s, a) => s + (a.channels_count || 0), 0) || 0;
+    const groups = accounts?.reduce((s, a) => s + Math.max(0, (a.groups_count || 0) - (a.channels_count || 0)), 0) || 0;
+    const botsTotal = (bots?.length || 0) || accounts?.reduce((s, a) => s + (a.bots_count || 0), 0) || 0;
+    const sent = jobs?.reduce((s, j) => s + j.targets.reduce((t: number, x: { sent_count?: number }) => t + (x.sent_count || 0), 0), 0) || 0;
+    const queueActive = queue?.filter((j) => j.status === 'pending' || j.status === 'processing').length || 0;
+    const activeJobs = queueActive + (jobs?.filter((j) => j.status === 'active').length || 0);
+
+    return res.json({
+      success: true,
+      data: {
+        accounts: accounts?.length || 0,
+        groups,
+        channels,
+        botsTotal,
+        sent,
+        activeJobs,
+      },
+    });
   } catch (err: any) {
-    return res.status(500).json({ success: false, error: err?.message || "Unexpected error." });
+    return res.status(500).json({ success: false, error: err?.message || "Failed to fetch overall stats" });
+  }
+});
+
+// GET /stats — combined workspace + overall stats in a single call
+// Workspace-scoped (uses workspace header), overall is global (all workspaces)
+router.get("/stats", async (req: Request, res: Response) => {
+  try {
+    const ws = getWorkspace(req);
+
+    // Workspace-scoped accounts
+    const { data: wsAccounts, error: wsAccError } = await supabase
+      .from("telegram_accounts")
+      .select("phone, username, groups_count, channels_count, bots_count, bots_created_24h, bots_next_reset, default_bots_count, crypto_bots_count, groups_created_24h, next_available_time, flood_wait_until")
+      .eq("workspace", ws);
+    if (wsAccError) throw wsAccError;
+
+    // Workspace-scoped bots
+    const { data: wsBots, error: wsBotError } = await supabase
+      .from("telegram_bots")
+      .select("id, username, display_name, owner_phone, theme, created_at")
+      .eq("workspace", ws);
+    if (wsBotError) throw wsBotError;
+
+    // Workspace-scoped queue jobs
+    const { data: wsQueue, error: wsQueueError } = await supabase
+      .from("group_creation_queue")
+      .select("*")
+      .eq("workspace", ws)
+      .order("created_at", { ascending: false });
+    if (wsQueueError) throw wsQueueError;
+
+    // Workspace-scoped messaging jobs
+    const { data: wsJobs, error: wsJobsError } = await supabase
+      .from("messaging_jobs")
+      .select("*, targets:messaging_targets(*)")
+      .eq("workspace", ws)
+      .order("created_at", { ascending: false });
+    if (wsJobsError) throw wsJobsError;
+
+    // Overall (all workspaces) accounts
+    const { data: allAccounts, error: allAccError } = await supabase
+      .from("telegram_accounts")
+      .select("phone, username, groups_count, channels_count, bots_count, bots_created_24h, bots_next_reset, default_bots_count, crypto_bots_count, groups_created_24h, next_available_time, flood_wait_until");
+    if (allAccError) throw allAccError;
+
+    // Overall bots
+    const { data: allBots, error: allBotError } = await supabase
+      .from("telegram_bots")
+      .select("id, username, display_name, owner_phone, theme, created_at");
+    if (allBotError) throw allBotError;
+
+    // Overall queue jobs
+    const { data: allQueue, error: allQueueError } = await supabase
+      .from("group_creation_queue")
+      .select("*")
+      .order("created_at", { ascending: false });
+    if (allQueueError) throw allQueueError;
+
+    // Overall messaging jobs
+    const { data: allJobs, error: allJobsError } = await supabase
+      .from("messaging_jobs")
+      .select("*, targets:messaging_targets(*)")
+      .order("created_at", { ascending: false });
+    if (allJobsError) throw allJobsError;
+
+    // Workspace aggregates
+    const wsChannels = wsAccounts?.reduce((s, a) => s + (a.channels_count || 0), 0) || 0;
+    const wsGroups = wsAccounts?.reduce((s, a) => s + Math.max(0, (a.groups_count || 0) - (a.channels_count || 0)), 0) || 0;
+    const wsBotsTotal = (wsBots?.length || 0) || wsAccounts?.reduce((s, a) => s + (a.bots_count || 0), 0) || 0;
+    const wsSent = wsJobs?.reduce((s, j) => s + j.targets.reduce((t: number, x: { sent_count?: number }) => t + (x.sent_count || 0), 0), 0) || 0;
+    const wsQueueActive = wsQueue?.filter((j) => j.status === 'pending' || j.status === 'processing').length || 0;
+    const wsActiveJobs = wsQueueActive + (wsJobs?.filter((j) => j.status === 'active').length || 0);
+
+    // Overall aggregates
+    const allChannels = allAccounts?.reduce((s, a) => s + (a.channels_count || 0), 0) || 0;
+    const allGroups = allAccounts?.reduce((s, a) => s + Math.max(0, (a.groups_count || 0) - (a.channels_count || 0)), 0) || 0;
+    const allBotsTotal = (allBots?.length || 0) || allAccounts?.reduce((s, a) => s + (a.bots_count || 0), 0) || 0;
+    const allSent = allJobs?.reduce((s, j) => s + j.targets.reduce((t: number, x: { sent_count?: number }) => t + (x.sent_count || 0), 0), 0) || 0;
+    const allQueueActive = allQueue?.filter((j) => j.status === 'pending' || j.status === 'processing').length || 0;
+    const allActiveJobs = allQueueActive + (allJobs?.filter((j) => j.status === 'active').length || 0);
+
+    return res.json({
+      success: true,
+      data: {
+        workspace: {
+          groups: wsGroups,
+          channels: wsChannels,
+          botsTotal: wsBotsTotal,
+          sent: wsSent,
+          activeJobs: wsActiveJobs,
+        },
+        overall: {
+          accounts: allAccounts?.length || 0,
+          groups: allGroups,
+          channels: allChannels,
+          botsTotal: allBotsTotal,
+          sent: allSent,
+          activeJobs: allActiveJobs,
+        },
+      },
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || "Failed to fetch stats" });
   }
 });
 
