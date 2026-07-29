@@ -260,6 +260,67 @@ function waitForNextStep(conv: any, editOf: any): Promise<any> {
   ]);
 }
 
+// List ALL bots on the account via /mybots, paginating with the "»" button.
+// Used by the bot-check job to reconcile the DB with reality. Usernames are
+// returned lowercase, without the leading @.
+export type ListBotsResult =
+  | { ok: true; usernames: string[] }
+  | { ok: false; reason: "flood" | "timeout" | "error"; message: string; retryAfter?: number };
+
+export async function listBotsViaBotFather(
+  client: any,
+  log: LogFn
+): Promise<ListBotsResult> {
+  const conv = new Conversation(client, BOTFATHER);
+  try {
+    return await conv.with(async () => {
+      log("BotFather → /mybots");
+      await conv.sendText("/mybots");
+      let reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+      log(`BotFather ⇐ ${short(reply.text)}`);
+
+      const t = (reply.text || "").toLowerCase();
+      if (/too many attempts|try again later|flood/.test(t)) {
+        return {
+          ok: false,
+          reason: "flood",
+          message: reply.text,
+          retryAfter: parseRetrySeconds(reply.text),
+        };
+      }
+
+      // No inline keyboard = no bots ("You currently don't have any bots").
+      const usernames = new Set<string>();
+      for (let page = 0; page < 20; page++) {
+        const buttons = getInlineButtons(reply);
+        if (!buttons.length) break;
+        for (const row of buttons) {
+          for (const btn of row) {
+            // Bot buttons read "@username"; nav buttons («, ») don't match.
+            const m =
+              typeof btn.text === "string" && btn.text.match(/@([A-Za-z0-9_]+)/);
+            if (m) usernames.add(m[1].toLowerCase());
+          }
+        }
+        const nextBtn = findButtonContaining(buttons, "»");
+        if (!nextBtn) break;
+        log(`BotFather → click » (page ${page + 2})`);
+        await clickInlineButton(client, reply, nextBtn);
+        reply = await waitForNextStep(conv, reply);
+      }
+      return { ok: true, usernames: [...usernames] };
+    });
+  } catch (err: any) {
+    const message = String(err?.message || err);
+    if (isTimeoutErr(err)) {
+      log(`BotFather: timed out while listing bots — ${message}`, "error");
+      return { ok: false, reason: "timeout", message };
+    }
+    log(`BotFather: /mybots listing error — ${message}`, "error");
+    return { ok: false, reason: "error", message };
+  }
+}
+
 export async function deleteBotViaBotFather(
   client: any,
   botUsername: string, // without @
@@ -351,6 +412,157 @@ export async function deleteBotViaBotFather(
       return { ok: false, reason: "timeout", message };
     }
     log(`BotFather: deletion error for @${botUsername} — ${message}`, "error");
+    return { ok: false, reason: "error", message };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bot ownership transfer via BotFather conversation.
+//
+// Flow:
+//   1. /mybots → find bot → click it → action menu
+//   2. Click "Transfer Ownership" → message edited with "Choose recipient"
+//   3. Click "Choose recipient" → BotFather asks for the new owner
+//   4. Send the recipient's @username as text
+//      → "Oops! Please make sure the new owner has sent at least one message
+//         to the bot..."  = recipient_invalid (skip this bot)
+//      → "You are about to transfer ownership..." + "Yes, I am sure, proceed."
+//   5. Click "Yes, I am sure, proceed."
+//   6. If the account has 2FA, BotFather asks for the password → send it
+//   7. Success reply → done
+// ---------------------------------------------------------------------------
+
+export type TransferBotResult =
+  | { ok: true }
+  | {
+      ok: false;
+      reason:
+        | "not_found"        // bot missing from /mybots
+        | "recipient_invalid" // the "Oops!..." reply — skip bot, keep going
+        | "needs_password"    // 2FA asked but no password was provided
+        | "bad_password"      // 2FA rejected the password — fail the job
+        | "flood"
+        | "timeout"
+        | "error";
+      message: string;
+      retryAfter?: number;
+    };
+
+export async function transferBotViaBotFather(
+  client: any,
+  botUsername: string, // without @
+  recipient: string, // @username of the new owner (with or without @)
+  password: string | undefined, // 2FA password, if the account has one
+  log: LogFn
+): Promise<TransferBotResult> {
+  const conv = new Conversation(client, BOTFATHER);
+  const usernameLower = botUsername.toLowerCase();
+  const recipientHandle = recipient.startsWith("@") ? recipient : `@${recipient}`;
+
+  try {
+    return await conv.with(async () => {
+      // Step 1: /mybots → find and click the bot
+      log("BotFather → /mybots");
+      await conv.sendText("/mybots");
+      let reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+      log(`BotFather ⇐ ${short(reply.text)}`);
+
+      const t0 = (reply.text || "").toLowerCase();
+      if (/too many attempts|try again later|flood/.test(t0)) {
+        return { ok: false, reason: "flood", message: reply.text, retryAfter: parseRetrySeconds(reply.text) };
+      }
+
+      const found = await findBotInList(client, conv, reply, usernameLower, log);
+      if (!found) {
+        return { ok: false, reason: "not_found", message: `@${botUsername} not found in /mybots list` };
+      }
+
+      log(`BotFather → click @${botUsername}`);
+      await clickInlineButton(client, found.msg, found.btn);
+      reply = await waitForNextStep(conv, found.msg);
+      log(`BotFather ⇐ ${short(reply.text)}`);
+
+      // Step 2: "Transfer Ownership"
+      const transferBtn = findButtonContaining(getInlineButtons(reply), "Transfer Ownership");
+      if (!transferBtn) {
+        return { ok: false, reason: "error", message: "Transfer Ownership button not found" };
+      }
+      log("BotFather → click Transfer Ownership");
+      await clickInlineButton(client, reply, transferBtn);
+      reply = await waitForNextStep(conv, reply);
+      log(`BotFather ⇐ ${short(reply.text)}`);
+
+      // Step 3: "Choose recipient"
+      const chooseBtn = findButtonContaining(getInlineButtons(reply), "Choose recipient");
+      if (chooseBtn) {
+        log("BotFather → click Choose recipient");
+        await clickInlineButton(client, reply, chooseBtn);
+        reply = await waitForNextStep(conv, reply);
+        log(`BotFather ⇐ ${short(reply.text)}`);
+      }
+      // (If the button is absent BotFather already asked for the recipient.)
+
+      // Step 4: send the recipient's @username
+      log(`BotFather → recipient: ${recipientHandle}`);
+      await sleep(SEND_DELAY);
+      await conv.sendText(recipientHandle);
+      reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+      log(`BotFather ⇐ ${short(reply.text)}`);
+
+      const t1 = (reply.text || "").toLowerCase();
+      if (/oops/.test(t1)) {
+        // "...make sure the new owner has sent at least one message to the bot"
+        return { ok: false, reason: "recipient_invalid", message: reply.text };
+      }
+      if (/too many attempts|try again later|flood/.test(t1)) {
+        return { ok: false, reason: "flood", message: reply.text, retryAfter: parseRetrySeconds(reply.text) };
+      }
+
+      // Step 5: "Yes, I am sure, proceed."
+      const sureBtn = findButtonContaining(getInlineButtons(reply), "I am sure");
+      if (!sureBtn) {
+        return { ok: false, reason: "error", message: `Confirmation button not found (reply: ${short(reply.text)})` };
+      }
+      log(`BotFather → click "${sureBtn.text}"`);
+      await clickInlineButton(client, reply, sureBtn);
+      reply = await waitForNextStep(conv, reply);
+      log(`BotFather ⇐ ${short(reply.text)}`);
+
+      // Step 6: optional 2FA password prompt
+      let t2 = (reply.text || "").toLowerCase();
+      if (/password|two-step|2fa/.test(t2)) {
+        if (!password) {
+          return { ok: false, reason: "needs_password", message: reply.text };
+        }
+        log("BotFather → 2FA password");
+        await sleep(SEND_DELAY);
+        await conv.sendText(password);
+        reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
+        log(`BotFather ⇐ ${short(reply.text)}`);
+        t2 = (reply.text || "").toLowerCase();
+        if (/invalid|wrong|incorrect/.test(t2) && /password/.test(t2)) {
+          return { ok: false, reason: "bad_password", message: reply.text };
+        }
+      }
+
+      // Step 7: verdict
+      if (/success|transferred|congratulations|new owner/.test(t2)) {
+        log(`Bot @${botUsername} transferred to ${recipientHandle}.`, "success");
+        return { ok: true };
+      }
+      if (/too many attempts|try again|flood/.test(t2)) {
+        return { ok: false, reason: "flood", message: reply.text, retryAfter: parseRetrySeconds(reply.text) };
+      }
+      // Unrecognized final reply — treat as error so nothing is silently counted.
+      return { ok: false, reason: "error", message: `Unexpected final reply: ${short(reply.text)}` };
+    });
+  } catch (err: any) {
+    const message = String(err?.message || err);
+    if (isTimeoutErr(err)) {
+      log(`BotFather: timed out during transfer of @${botUsername} — ${message}`, "error");
+      return { ok: false, reason: "timeout", message };
+    }
+    log(`BotFather: transfer error for @${botUsername} — ${message}`, "error");
     return { ok: false, reason: "error", message };
   }
 }

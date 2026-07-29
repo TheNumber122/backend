@@ -15,7 +15,7 @@ import { supabase, protectedDb } from "./db/supabase";
 import { broadcastLog } from "./broadcast";
 import { getWorkspace } from "./workspace";
 import { getBotUsernames, markTried, botDisplayName } from "./ai/groq";
-import { createBotViaBotFather, deleteBotViaBotFather } from "./telegram/botfather";
+import { createBotViaBotFather, deleteBotViaBotFather, listBotsViaBotFather, transferBotViaBotFather } from "./telegram/botfather";
 import { listChatsForAccount, TargetKind } from "./telegram/dialogs";
 import { sendToChat, SendContent } from "./telegram/send";
 import { generateBroadcastMessages } from "./ai/messages";
@@ -424,12 +424,35 @@ async function processQueue() {
           }
         }
 
-        // 2. Bot jobs: pick the one due soonest (null next_attempt_at = never
-        //    served = go now). Round-robin falls out of ordering by next_attempt_at.
+        // 1c. Bot check jobs: reconcile telegram_bots with the account's real
+        //     bot list. Same next_attempt_at handling as deletion jobs.
+        const { data: checkJob } = await supabase
+          .from("group_creation_queue")
+          .select("*")
+          .eq("type", "bot_check")
+          .in("status", ["pending", "processing"])
+          .order("created_at", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (checkJob) {
+          const checkDueAt = checkJob.next_attempt_at
+            ? new Date(checkJob.next_attempt_at).getTime()
+            : 0;
+          if (checkDueAt <= Date.now()) {
+            await runBotCheckJob(checkJob);
+            continue;
+          }
+        }
+
+        // 2. Bot jobs (create + transfer): pick the one due soonest (null
+        //    next_attempt_at = never served = go now). Round-robin falls out of
+        //    ordering by next_attempt_at; both types share the same 5-min
+        //    per-account pacing so they interleave naturally.
         const { data: botJob } = await supabase
           .from("group_creation_queue")
           .select("*")
-          .eq("type", "bot")
+          .in("type", ["bot", "bot_transfer"])
           .in("status", ["pending", "processing"])
           .order("next_attempt_at", { ascending: true, nullsFirst: true })
           .order("created_at", { ascending: true })
@@ -448,7 +471,11 @@ async function processQueue() {
           continue;
         }
 
-        await runOneBotStep(botJob);
+        if (botJob.type === "bot_transfer") {
+          await runOneTransferStep(botJob);
+        } else {
+          await runOneBotStep(botJob);
+        }
         // Breather after disconnecting this account before moving to the next one.
         await sleep(BOT_INTER_ACCOUNT_MS);
       } catch (iterErr: any) {
@@ -847,6 +874,352 @@ async function runBotDeleteJob(job: any) {
       .update({ status: "failed", completed_at: nowIso(), error_message: err?.message || "Unknown error" })
       .eq("id", job.id);
     log(`Bot deletion job #${job.id} failed: ${err?.message || "Unknown error"}`, "error");
+  } finally {
+    if (client) {
+      try { await clearSession(job.phone); } catch { /* ignore */ }
+    }
+  }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Bot transfer job: hand bots over to a new owner via BotFather, ONE bot per
+// step, paced like bot creation (5-min per-account cooldown, round-robin with
+// other bot jobs). Each job targets one owner account; its payload lives as
+// JSON in `description`: { usernames, recipient, password }. Telegram caps
+// transfers at 3 per account per 24h (check_transfer_limits) — when the cap is
+// hit the job parks until the window resets. Never throws.
+// ---------------------------------------------------------------------------
+type TransferPayload = { usernames: string[]; recipient: string; password?: string };
+
+async function runOneTransferStep(job: any) {
+  const log = (message: string, type: "info" | "success" | "error" = "info") =>
+    broadcastLog({ message, type, timestamp: new Date().toISOString() });
+  const nowIso = () => new Date().toISOString();
+
+  const payload: TransferPayload = (() => {
+    try { return JSON.parse(job.description || "{}"); }
+    catch { return { usernames: [], recipient: "" }; }
+  })();
+  const usernames = payload.usernames || [];
+  const total = job.group_count || usernames.length;
+  const done = job.bots_done ?? 0;
+
+  if (!usernames.length || !payload.recipient || done >= usernames.length) {
+    await supabase
+      .from("group_creation_queue")
+      .update({ status: "completed", completed_at: nowIso(), next_attempt_at: null })
+      .eq("id", job.id);
+    return;
+  }
+
+  // First touch: flip pending → processing and announce the job.
+  if (job.status === "pending") {
+    await supabase
+      .from("group_creation_queue")
+      .update({ status: "processing", started_at: nowIso() })
+      .eq("id", job.id);
+    log(
+      `Starting transfer job #${job.id} for ${job.phone}: ${total} bot(s) → @${payload.recipient.replace(/^@/, "")}.`
+    );
+  }
+
+  // Enforce the 3-transfers/24h cap BEFORE any session work (cheap DB check).
+  const { data: limits } = await supabase.rpc("check_transfer_limits", {
+    account_phone: job.phone,
+  });
+  if (limits && limits.can_transfer === false) {
+    const resetAt = limits.next_reset
+      ? new Date(limits.next_reset).toISOString()
+      : new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    await supabase
+      .from("group_creation_queue")
+      .update({ next_attempt_at: resetAt, status: "processing" })
+      .eq("id", job.id);
+    log(
+      `Account ${job.phone} hit the 3-per-24h transfer limit. Next transfer after ${new Date(
+        resetAt
+      ).toLocaleString()}. (${done}/${total} done)`
+    );
+    return;
+  }
+
+  const username = usernames[done];
+  let client: any = null;
+  const result = await withAccountLock(async () => {
+    try {
+      client = await getClientByPhone(job.phone);
+      try {
+        const me = await client.getMe();
+        log(`Account ${job.phone} online as @${me?.username ?? me?.firstName ?? "unknown"}.`);
+      } catch (meErr: any) {
+        log(`Session invalid for ${job.phone} (${meErr?.message || meErr}); recreating...`, "error");
+        await clearSession(job.phone);
+        client = await getClientByPhone(job.phone);
+      }
+      try { await client.startUpdatesLoop(); } catch { /* may already be running */ }
+
+      log(`Transferring bot @${username} (${done + 1}/${total}) to @${payload.recipient.replace(/^@/, "")}...`);
+      return await transferBotViaBotFather(client, username, payload.recipient, payload.password, log);
+    } catch (err: any) {
+      return { ok: false as const, reason: "error" as const, message: String(err?.message || err) };
+    } finally {
+      if (client) {
+        try { await clearSession(job.phone); } catch { /* ignore */ }
+      }
+    }
+  });
+
+  // Advance to the next bot (shared by success and skip cases below).
+  const advance = async (extra: Record<string, any> = {}) => {
+    const newDone = done + 1;
+    if (newDone >= usernames.length) {
+      await supabase
+        .from("group_creation_queue")
+        .update({ bots_done: newDone, status: "completed", completed_at: nowIso(), next_attempt_at: null, ...extra })
+        .eq("id", job.id);
+      log(`Transfer job #${job.id} for ${job.phone} complete — ${newDone}/${total} bot(s) processed.`, "success");
+    } else {
+      const nextAt = new Date(Date.now() + BOT_COOLDOWN_MS).toISOString();
+      await supabase
+        .from("group_creation_queue")
+        .update({ bots_done: newDone, next_attempt_at: nextAt, status: "processing", ...extra })
+        .eq("id", job.id);
+      log(
+        `Transfer ${newDone}/${total} step done for ${job.phone}. Next transfer for this ` +
+          `account in ~${Math.round(BOT_COOLDOWN_MS / 60000)} min (other accounts run meanwhile).`
+      );
+    }
+  };
+
+  if (result.ok) {
+    // The bot left this account — drop its row and fix the counters.
+    const { data: botRow } = await supabase
+      .from("telegram_bots")
+      .select("pattern")
+      .eq("username", username)
+      .eq("owner_phone", job.phone)
+      .single();
+    await supabase
+      .from("telegram_bots")
+      .delete()
+      .eq("username", username)
+      .eq("owner_phone", job.phone);
+    await supabase.rpc("register_bot_transfer", {
+      account_phone: job.phone,
+      bot_pattern: botRow?.pattern || "default",
+    });
+    await advance();
+    return;
+  }
+
+  if (result.reason === "recipient_invalid" || result.reason === "not_found") {
+    // Recipient never messaged this bot / bot gone — skip it, keep going.
+    log(`Skipping @${username}: ${result.reason} — ${result.message}`, "error");
+    await advance({ error_message: `@${username}: ${result.reason}` });
+    return;
+  }
+
+  if (result.reason === "bad_password" || result.reason === "needs_password") {
+    // A wrong/missing 2FA password can never succeed on retry — fail the job.
+    await supabase
+      .from("group_creation_queue")
+      .update({
+        status: "failed",
+        completed_at: nowIso(),
+        error_message: `2FA problem (${result.reason}): ${result.message}`,
+      })
+      .eq("id", job.id);
+    log(`Transfer job #${job.id} failed: 2FA ${result.reason} for ${job.phone}.`, "error");
+    return;
+  }
+
+  // flood / timeout / error → back off and retry the SAME bot later, up to a cap.
+  const failures = (job.bots_attempts ?? 0) + 1;
+  if (failures >= MAX_BOT_FAILURES) {
+    await supabase
+      .from("group_creation_queue")
+      .update({
+        status: "failed",
+        completed_at: nowIso(),
+        bots_attempts: failures,
+        error_message: `Gave up after ${failures} failed attempts (last: ${result.reason}).`,
+      })
+      .eq("id", job.id);
+    log(`Transfer job #${job.id} for ${job.phone} failed after ${failures} attempts (${result.reason}).`, "error");
+    return;
+  }
+  const { ms: backoff, detail } = backoffForBotFailure({
+    status: result.reason as "flood" | "timeout" | "error",
+    retryAfterMs: result.reason === "flood" && result.retryAfter ? result.retryAfter * 1000 : undefined,
+  });
+  const nextAt = new Date(Date.now() + backoff).toISOString();
+  await supabase
+    .from("group_creation_queue")
+    .update({ bots_attempts: failures, next_attempt_at: nextAt, status: "processing" })
+    .eq("id", job.id);
+  log(
+    `Transfer attempt for ${job.phone} did not succeed (${result.reason}: ${detail}). ` +
+      `Retrying in ~${Math.round(backoff / 60000)} min. [${failures}/${MAX_BOT_FAILURES} failures]`,
+    "error"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Bot check job: reconcile telegram_bots with the account's REAL bot list from
+// BotFather /mybots. Two fixes:
+//   • DB row whose bot is gone (transferred away) → delete the row.
+//   • Bot on the account with no DB row → save it with the placeholder token
+//     "9999999999:unknown" so mass-delete (which parses the token's numeric
+//     prefix into bot_id) can target it at any threshold.
+// Afterwards bots_count / per-pattern counters are recomputed from reality.
+// One job per account; never throws.
+// ---------------------------------------------------------------------------
+const UNKNOWN_BOT_TOKEN = "9999999999:unknown";
+
+async function runBotCheckJob(job: any) {
+  const log = (message: string, type: "info" | "success" | "error" = "info") =>
+    broadcastLog({ message, type, timestamp: new Date().toISOString() });
+  const nowIso = () => new Date().toISOString();
+
+  if (job.status === "pending") {
+    await supabase
+      .from("group_creation_queue")
+      .update({ status: "processing", started_at: nowIso() })
+      .eq("id", job.id);
+    log(`Starting bot check job #${job.id} for ${job.phone}.`);
+  }
+
+  let client: any = null;
+  // Hold the account lock for the whole job (same reason as runBotDeleteJob).
+  await withAccountLock(async () => {
+  try {
+    client = await getClientByPhone(job.phone);
+
+    try {
+      const me = await client.getMe();
+      log(`Account ${job.phone} online as @${me?.username ?? me?.firstName ?? "unknown"}.`);
+    } catch (meErr: any) {
+      log(`Session invalid for ${job.phone} (${meErr?.message || meErr}); recreating...`, "error");
+      await clearSession(job.phone);
+      client = await getClientByPhone(job.phone);
+    }
+
+    try { await client.startUpdatesLoop(); } catch { /* may already be running */ }
+
+    const listed = await listBotsViaBotFather(client, log);
+    if (!listed.ok) {
+      if (listed.reason === "flood") {
+        const waitMs = Math.min(
+          Math.max((listed.retryAfter ?? 900) * 1000, BOT_FLOOD_MIN_MS),
+          BOT_FLOOD_MAX_MS
+        );
+        const nextAt = new Date(Date.now() + waitMs).toISOString();
+        await supabase
+          .from("group_creation_queue")
+          .update({ next_attempt_at: nextAt, status: "processing" })
+          .eq("id", job.id);
+        log(
+          `Flood while listing bots for ${job.phone} — retrying in ~${Math.round(waitMs / 60000)} min.`,
+          "error"
+        );
+        return;
+      }
+      await supabase
+        .from("group_creation_queue")
+        .update({ status: "failed", completed_at: nowIso(), error_message: listed.message })
+        .eq("id", job.id);
+      log(`Bot check job #${job.id} for ${job.phone} failed: ${listed.message}`, "error");
+      return;
+    }
+
+    const real = new Set(listed.usernames);
+    log(`BotFather lists ${real.size} bot(s) for ${job.phone}.`);
+
+    const { data: rows, error: rowsErr } = await supabase
+      .from("telegram_bots")
+      .select("id, username, pattern")
+      .eq("owner_phone", job.phone);
+    if (rowsErr) throw new Error(rowsErr.message);
+
+    // 1. Stale rows: in the DB but not on the account anymore (transferred).
+    const stale = (rows || []).filter((r: any) => !real.has(r.username.toLowerCase()));
+    for (const r of stale) {
+      await supabase.from("telegram_bots").delete().eq("id", r.id);
+      log(`Removed stale DB row for @${r.username} (no longer on ${job.phone}).`);
+    }
+
+    // 2. Unsaved bots: on the account but missing from the DB. If the row lives
+    // under ANOTHER owner (transferred between our accounts), move it — never
+    // clobber its real token with the placeholder. Otherwise insert a
+    // placeholder row mass-delete can target.
+    const known = new Set((rows || []).map((r: any) => r.username.toLowerCase()));
+    const missing = listed.usernames.filter((u) => !known.has(u));
+    if (missing.length) {
+      const { data: elsewhere } = await supabase
+        .from("telegram_bots")
+        .select("id, username, owner_phone")
+        .in("username", missing);
+      const byName = new Map(
+        (elsewhere || []).map((r: any) => [r.username.toLowerCase(), r])
+      );
+      for (const username of missing) {
+        const existing = byName.get(username);
+        if (existing) {
+          await supabase
+            .from("telegram_bots")
+            .update({ owner_phone: job.phone, workspace: job.workspace || "default" })
+            .eq("id", existing.id);
+          log(`Moved @${username} from ${existing.owner_phone} to ${job.phone}.`);
+        } else {
+          // ponytail: pattern guessed from the handle (crypto* → crypto), good
+          // enough for the 10/10 split; correct manually if a custom bot slips in.
+          const pattern = username.startsWith("crypto") ? "crypto" : "default";
+          const { error: insErr } = await supabase.from("telegram_bots").insert({
+            workspace: job.workspace || "default",
+            owner_phone: job.phone,
+            username,
+            display_name: null,
+            token: UNKNOWN_BOT_TOKEN,
+            theme: pattern === "crypto" ? "crypto" : null,
+            pattern,
+          });
+          if (insErr) log(`Could not save @${username}: ${insErr.message}`, "error");
+          else log(`Saved unlisted bot @${username} with placeholder token (ID 9999999999).`);
+        }
+      }
+    }
+
+    // 3. Recompute account counters from reality (24h window left untouched —
+    // creations already spent stay spent).
+    const { data: after } = await supabase
+      .from("telegram_bots")
+      .select("pattern")
+      .eq("owner_phone", job.phone);
+    await supabase
+      .from("telegram_accounts")
+      .update({
+        bots_count: real.size,
+        default_bots_count: (after || []).filter((r: any) => r.pattern === "default").length,
+        crypto_bots_count: (after || []).filter((r: any) => r.pattern === "crypto").length,
+      })
+      .eq("phone", job.phone);
+
+    await supabase
+      .from("group_creation_queue")
+      .update({ status: "completed", completed_at: nowIso(), bots_done: 1, next_attempt_at: null })
+      .eq("id", job.id);
+    log(
+      `Bot check for ${job.phone} done — ${real.size} real bot(s), ` +
+        `${stale.length} stale row(s) removed, ${missing.length} unsaved bot(s) recorded.`,
+      "success"
+    );
+  } catch (err: any) {
+    await supabase
+      .from("group_creation_queue")
+      .update({ status: "failed", completed_at: nowIso(), error_message: err?.message || "Unknown error" })
+      .eq("id", job.id);
+    log(`Bot check job #${job.id} failed: ${err?.message || "Unknown error"}`, "error");
   } finally {
     if (client) {
       try { await clearSession(job.phone); } catch { /* ignore */ }
@@ -2022,6 +2395,72 @@ router.get("/bots", async (req: Request, res: Response) => {
   }
 });
 
+// POST /bots/check — enqueue one bot_check job per phone to reconcile the DB
+// with the account's real bot list (see runBotCheckJob).
+router.post("/bots/check", async (req: Request, res: Response) => {
+  const ws = getWorkspace(req);
+  const phones: string[] = Array.isArray(req.body.phones) ? req.body.phones : [];
+  if (!phones.length) {
+    return res.status(400).json({ success: false, error: "phones must be a non-empty array" });
+  }
+
+  try {
+    const jobIds: number[] = [];
+    for (const phone of phones) {
+      // Account must belong to the caller's workspace.
+      const { data: owned } = await supabase
+        .from("telegram_accounts")
+        .select("phone")
+        .eq("phone", phone)
+        .eq("workspace", ws)
+        .single();
+      if (!owned) continue;
+
+      // Skip if a check for this phone is already queued/running.
+      const { data: dupe } = await supabase
+        .from("group_creation_queue")
+        .select("id")
+        .eq("type", "bot_check")
+        .eq("phone", phone)
+        .in("status", ["pending", "processing"])
+        .limit(1)
+        .maybeSingle();
+      if (dupe) continue;
+
+      const { data: job, error: jobError } = await supabase
+        .from("group_creation_queue")
+        .insert({
+          phone,
+          workspace: ws,
+          group_count: 1,
+          naming_pattern: "check",
+          description: "",
+          type: "bot_check",
+          status: "pending",
+          created_at: new Date().toISOString(),
+        })
+        .select()
+        .single();
+      if (jobError) {
+        broadcastLog({
+          message: `Failed to enqueue bot check for ${phone}: ${jobError.message}`,
+          type: "error",
+          timestamp: new Date().toISOString(),
+        });
+        continue;
+      }
+      jobIds.push(job.id);
+    }
+
+    processQueue();
+    return res.json({ success: true, data: { job_ids: jobIds, totalJobs: jobIds.length } });
+  } catch (err: any) {
+    return res
+      .status(500)
+      .json({ success: false, error: err?.message || "Failed to enqueue bot checks" });
+  }
+});
+
 // ===========================================================================
 // MASS BOT DELETION
 //   • preview — returns all bots with token ID > threshold, grouped by owner
@@ -2031,6 +2470,12 @@ router.get("/bots", async (req: Request, res: Response) => {
 // Fetch ALL workspace bots (supabase caps a single select at 1000 rows, so we
 // page through) and keep those whose token's numeric bot ID exceeds threshold.
 async function fetchBotsAboveThreshold(ws: string, threshold: number) {
+  const bots = await fetchAllWorkspaceBots(ws);
+  return bots.filter((b: any) => b.bot_id > threshold);
+}
+
+// Shared paged fetch: every workspace bot with its parsed numeric bot_id.
+async function fetchAllWorkspaceBots(ws: string) {
   const PAGE = 1000;
   const all: any[] = [];
   for (let from = 0; ; from += PAGE) {
@@ -2046,7 +2491,7 @@ async function fetchBotsAboveThreshold(ws: string, threshold: number) {
   }
   return all
     .map((b: any) => ({ ...b, bot_id: parseInt((b.token || "").split(":")[0], 10) }))
-    .filter((b: any) => Number.isFinite(b.bot_id) && b.bot_id > threshold);
+    .filter((b: any) => Number.isFinite(b.bot_id));
 }
 
 // POST /bots/delete/preview — show which bots would be deleted
@@ -2179,6 +2624,147 @@ router.post("/bots/delete/confirm", async (req: Request, res: Response) => {
     return res
       .status(500)
       .json({ success: false, error: err?.message || "Failed to create deletion jobs" });
+  }
+});
+
+// ===========================================================================
+// MASS BOT TRANSFER — hand bots below a token-ID threshold to a new owner.
+//   • preview — bots with token ID BELOW threshold, grouped by owner
+//   • confirm — one bot_transfer queue job per owner; payload (usernames,
+//     recipient, 2FA password) rides in the job's description as JSON.
+// ===========================================================================
+
+// POST /bots/transfer/preview — show which bots could be transferred
+router.post("/bots/transfer/preview", async (req: Request, res: Response) => {
+  try {
+    const ws = getWorkspace(req);
+    const threshold = Number(req.body.threshold) || 0;
+
+    const matched = (await fetchAllWorkspaceBots(ws))
+      .filter((b: any) => b.bot_id < threshold)
+      .sort((a: any, b: any) => a.bot_id - b.bot_id);
+
+    const groupedByOwner: Record<string, any[]> = {};
+    for (const bot of matched) {
+      const phone = bot.owner_phone || "unknown";
+      if (!groupedByOwner[phone]) groupedByOwner[phone] = [];
+      groupedByOwner[phone].push(bot);
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        bots: matched.map((b: any) => ({
+          username: b.username,
+          bot_id: b.bot_id,
+          owner_phone: b.owner_phone,
+          display_name: b.display_name,
+          pattern: b.pattern,
+          created_at: b.created_at,
+        })),
+        totalCount: matched.length,
+        groupedByOwner,
+      },
+    });
+  } catch (err: any) {
+    return res
+      .status(500)
+      .json({ success: false, error: err?.message || "Preview failed" });
+  }
+});
+
+// POST /bots/transfer/confirm — create transfer queue jobs.
+// Body: { usernames: string[], recipient: string, password?: string }
+router.post("/bots/transfer/confirm", async (req: Request, res: Response) => {
+  try {
+    const ws = getWorkspace(req);
+    const recipient = String(req.body.recipient || "").trim().replace(/^@/, "");
+    const password = req.body.password ? String(req.body.password) : undefined;
+    const wanted = new Set<string>(
+      Array.isArray(req.body.usernames) ? req.body.usernames : []
+    );
+
+    if (!recipient || !/^[A-Za-z0-9_]{4,32}$/.test(recipient)) {
+      return res.status(400).json({ success: false, error: "A valid recipient @username is required." });
+    }
+    if (!wanted.size) {
+      return res.status(400).json({ success: false, error: "No bots selected." });
+    }
+
+    // Resolve the selected usernames to their owners from the DB (never trust
+    // client-side owner mapping).
+    const matched = (await fetchAllWorkspaceBots(ws)).filter((b: any) =>
+      wanted.has(b.username)
+    );
+    if (!matched.length) {
+      return res.status(400).json({ success: false, error: "Selected bots not found." });
+    }
+
+    const groupedByOwner: Record<string, any[]> = {};
+    for (const bot of matched) {
+      const phone = bot.owner_phone || "unknown";
+      if (!groupedByOwner[phone]) groupedByOwner[phone] = [];
+      groupedByOwner[phone].push(bot);
+    }
+
+    const jobIds: number[] = [];
+    for (const [ownerPhone, ownerBots] of Object.entries(groupedByOwner)) {
+      const { data: account } = await supabase
+        .from("telegram_accounts")
+        .select("phone")
+        .eq("phone", ownerPhone)
+        .eq("workspace", ws)
+        .single();
+      if (!account) {
+        broadcastLog({
+          message: `Skipping ${ownerBots.length} bot(s) — owner account ${ownerPhone} not found in workspace.`,
+          type: "error",
+          timestamp: new Date().toISOString(),
+        });
+        continue;
+      }
+
+      const usernames = ownerBots.map((b) => b.username);
+      const { data: job, error: jobError } = await supabase
+        .from("group_creation_queue")
+        .insert({
+          phone: ownerPhone,
+          workspace: ws,
+          group_count: usernames.length,
+          naming_pattern: recipient,
+          description: JSON.stringify({ usernames, recipient, password }),
+          type: "bot_transfer",
+          status: "pending",
+          bots_done: 0,
+          created_at: new Date().toISOString(),
+        })
+        .select()
+        .single();
+
+      if (jobError) {
+        broadcastLog({
+          message: `Failed to create transfer job for ${ownerPhone}: ${jobError.message}`,
+          type: "error",
+          timestamp: new Date().toISOString(),
+        });
+        continue;
+      }
+
+      jobIds.push(job.id);
+      broadcastLog({
+        message: `Transfer job #${job.id} created for ${ownerPhone}: ${usernames.length} bot(s) → @${recipient}.`,
+        type: "info",
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    processQueue();
+
+    return res.json({ success: true, data: { job_ids: jobIds, totalJobs: jobIds.length } });
+  } catch (err: any) {
+    return res
+      .status(500)
+      .json({ success: false, error: err?.message || "Failed to create transfer jobs" });
   }
 });
 

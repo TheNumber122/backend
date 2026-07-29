@@ -361,6 +361,76 @@ begin
 end;
 $$;
 
+-- Bot ownership transfers: Telegram allows max 3 transfers per account per 24h,
+-- tracked separately from the 3-creations/24h window. Same fixed-window design
+-- as bots_created_24h (window starts on the first transfer, does not slide).
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_name = 'telegram_accounts' and column_name = 'bots_transferred_24h'
+  ) then
+    alter table telegram_accounts add column bots_transferred_24h integer not null default 0;
+    alter table telegram_accounts add column transfers_next_reset timestamptz;
+  end if;
+end $$;
+
+-- Check the 3-transfers/24h limit, resetting the window if it elapsed.
+-- Returns json: { can_transfer, bots_transferred_24h, next_reset }.
+create or replace function check_transfer_limits(account_phone text)
+returns json
+language plpgsql
+as $$
+declare
+  acct telegram_accounts;
+  now_ts timestamptz := now();
+begin
+  select * into acct from telegram_accounts where phone = account_phone;
+  if acct is null then
+    return json_build_object('can_transfer', false, 'reason', 'not_found');
+  end if;
+
+  if acct.transfers_next_reset is not null and now_ts >= acct.transfers_next_reset then
+    update telegram_accounts
+    set bots_transferred_24h = 0, transfers_next_reset = null
+    where phone = account_phone;
+    acct.bots_transferred_24h := 0;
+    acct.transfers_next_reset := null;
+  end if;
+
+  if acct.bots_transferred_24h >= 3 then
+    return json_build_object('can_transfer', false, 'reason', 'daily',
+      'bots_transferred_24h', acct.bots_transferred_24h,
+      'next_reset', acct.transfers_next_reset);
+  end if;
+
+  return json_build_object('can_transfer', true,
+    'bots_transferred_24h', acct.bots_transferred_24h);
+end;
+$$;
+
+-- Record one successful transfer: bump the daily transfer counter (window starts
+-- on the first transfer) and decrement the total/per-pattern bot counters — the
+-- bot has left the account, same effect as a deletion (minus the 24h-creations
+-- decrement, since the creation still happened).
+create or replace function register_bot_transfer(
+  account_phone text,
+  bot_pattern text default 'default'
+)
+returns void
+language plpgsql
+as $$
+begin
+  update telegram_accounts
+  set bots_transferred_24h = bots_transferred_24h + 1,
+      transfers_next_reset = coalesce(transfers_next_reset, now() + interval '24 hours'),
+      bots_count = greatest(bots_count - 1, 0),
+      default_bots_count = greatest(default_bots_count - (case when bot_pattern = 'default' then 1 else 0 end), 0),
+      crypto_bots_count = greatest(crypto_bots_count - (case when bot_pattern = 'crypto' then 1 else 0 end), 0)
+  where phone = account_phone;
+end;
+$$;
+
 -- Add migration for first_creation_time if it exists
 do $$ 
 begin
