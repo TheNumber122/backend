@@ -250,14 +250,22 @@ function getInlineButtons(msg: any): any[][] {
 }
 
 // After clicking an inline button, BotFather either edits the menu message in
-// place or (rarely) sends a new one. Race both; first settled wins. The loser's
-// eventual rejection is swallowed so it can't crash the process.
-function waitForNextStep(conv: any, editOf: any): Promise<any> {
-  const swallow = (p: Promise<any>) => { p.catch(() => {}); return p; };
-  return Promise.race([
-    swallow(conv.waitForNewMessage(undefined, STEP_TIMEOUT)),
-    swallow(conv.waitForEdit(undefined, { message: editOf?.id, timeout: STEP_TIMEOUT })),
-  ]);
+// place or sends a new one. Do NOT race both: mtcute can't cancel the losing
+// waiter, and a leaked new-message waiter sits at the front of the queue and
+// swallows the NEXT real message (this silently broke transfers — the
+// "Please share the new owner's contact" reply was eaten by a stale waiter
+// from an earlier edit-resolved step, and the flow timed out every run).
+// Instead: wait briefly for an edit, then fall back to new messages. A new
+// message that arrives during the edit wait is buffered by the Conversation
+// and picked up instantly by waitForNewMessage.
+const EDIT_GRACE = 5000; // BotFather edits land sub-second; 5s is generous
+async function waitForNextStep(conv: any, editOf: any): Promise<any> {
+  try {
+    return await conv.waitForEdit(undefined, { message: editOf?.id, timeout: EDIT_GRACE });
+  } catch (e) {
+    if (!isTimeoutErr(e)) throw e;
+    return await conv.waitForNewMessage(undefined, STEP_TIMEOUT);
+  }
 }
 
 // List ALL bots on the account via /mybots, paginating with the "»" button.
