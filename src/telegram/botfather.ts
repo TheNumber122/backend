@@ -520,34 +520,33 @@ export async function transferBotViaBotFather(
         return { ok: false, reason: "flood", message: reply.text, retryAfter: parseRetrySeconds(reply.text) };
       }
 
-      // Step 5: "Yes, I am sure, proceed."
+      // Step 5: "Yes, I am sure, proceed." — this callback requires the 2FA
+      // password via SRP; it is never asked for in chat.
       const sureBtn = findButtonContaining(getInlineButtons(reply), "I am sure");
       if (!sureBtn) {
         return { ok: false, reason: "error", message: `Confirmation button not found (reply: ${short(reply.text)})` };
       }
       log(`BotFather → click "${sureBtn.text}"`);
-      await clickInlineButton(client, reply, sureBtn);
+      try {
+        await client.getCallbackAnswer({
+          message: reply,
+          data: sureBtn.data,
+          password,
+          timeout: 15000,
+        });
+      } catch (e: any) {
+        const m = String(e?.message || e);
+        if (/PASSWORD_HASH_INVALID/.test(m)) return { ok: false, reason: "bad_password", message: m };
+        if (/PASSWORD_MISSING|PASSWORD_EMPTY|SRP/.test(m)) return { ok: false, reason: "needs_password", message: m };
+        const fresh = m.match(/(?:PASSWORD|SESSION)_TOO_FRESH_(\d+)/);
+        if (fresh) return { ok: false, reason: "flood", message: m, retryAfter: parseInt(fresh[1], 10) };
+        if (!isTimeoutErr(e)) return { ok: false, reason: "error", message: m };
+      }
       reply = await waitForNextStep(conv, reply);
       log(`BotFather ⇐ ${short(reply.text)}`);
 
-      // Step 6: optional 2FA password prompt
-      let t2 = (reply.text || "").toLowerCase();
-      if (/password|two-step|2fa/.test(t2)) {
-        if (!password) {
-          return { ok: false, reason: "needs_password", message: reply.text };
-        }
-        log("BotFather → 2FA password");
-        await sleep(SEND_DELAY);
-        await conv.sendText(password);
-        reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
-        log(`BotFather ⇐ ${short(reply.text)}`);
-        t2 = (reply.text || "").toLowerCase();
-        if (/invalid|wrong|incorrect/.test(t2) && /password/.test(t2)) {
-          return { ok: false, reason: "bad_password", message: reply.text };
-        }
-      }
-
-      // Step 7: verdict
+      // Step 6: verdict
+      const t2 = (reply.text || "").toLowerCase();
       if (/success|transferred|congratulations|new owner/.test(t2)) {
         log(`Bot @${botUsername} transferred to ${recipientHandle}.`, "success");
         return { ok: true };
