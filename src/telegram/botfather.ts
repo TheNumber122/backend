@@ -56,7 +56,7 @@ function short(text: string): string {
 
 function isTimeoutErr(e: any): boolean {
   const m = String(e?.name || "") + " " + String(e?.message || e || "");
-  return /timeout/i.test(m);
+  return /timed?\s*out/i.test(m);
 }
 
 function classifyUsernameReply(
@@ -249,16 +249,10 @@ function getInlineButtons(msg: any): any[][] {
   return [];
 }
 
-// After clicking an inline button, BotFather either edits the menu message in
-// place or sends a new one. Do NOT race both: mtcute can't cancel the losing
-// waiter, and a leaked new-message waiter sits at the front of the queue and
-// swallows the NEXT real message (this silently broke transfers — the
-// "Please share the new owner's contact" reply was eaten by a stale waiter
-// from an earlier edit-resolved step, and the flow timed out every run).
-// Instead: wait briefly for an edit, then fall back to new messages. A new
-// message that arrives during the edit wait is buffered by the Conversation
-// and picked up instantly by waitForNewMessage.
-const EDIT_GRACE = 5000; // BotFather edits land sub-second; 5s is generous
+// Edit-first with new-message fallback — racing both leaks a waiter that eats
+// the next incoming message. New messages arriving during the edit wait are
+// buffered by the Conversation and returned instantly by the fallback.
+const EDIT_GRACE = 5000;
 async function waitForNextStep(conv: any, editOf: any): Promise<any> {
   try {
     return await conv.waitForEdit(undefined, { message: editOf?.id, timeout: EDIT_GRACE });
