@@ -12,6 +12,7 @@ import { Conversation, BotKeyboard } from "@mtcute/node";
 const BOTFATHER = "botfather";
 const STEP_TIMEOUT = 45000; // ms to wait for each BotFather reply
 const SEND_DELAY = 800; // ms between our messages (small gap; daily cap is the real guard)
+const CLICK_DELAY = 1000; // ms before clicking any inline button
 
 export type LogFn = (message: string, type?: "info" | "success" | "error") => void;
 
@@ -230,6 +231,7 @@ function findButtonContaining(
 
 // Click an inline button via getCallbackAnswer, fire-and-forget style.
 async function clickInlineButton(client: any, msg: any, btn: any): Promise<void> {
+  await sleep(CLICK_DELAY);
   try {
     await client.getCallbackAnswer({
       message: msg,
@@ -527,6 +529,7 @@ export async function transferBotViaBotFather(
         return { ok: false, reason: "error", message: `Confirmation button not found (reply: ${short(reply.text)})` };
       }
       log(`BotFather → click "${sureBtn.text}"`);
+      await sleep(CLICK_DELAY);
       try {
         await client.getCallbackAnswer({
           message: reply,
@@ -547,7 +550,7 @@ export async function transferBotViaBotFather(
 
       // Step 6: verdict
       const t2 = (reply.text || "").toLowerCase();
-      if (/success|transferred|congratulations|new owner/.test(t2)) {
+      if (/it worked|success|transferred|congratulations|new owner/.test(t2)) {
         log(`Bot @${botUsername} transferred to ${recipientHandle}.`, "success");
         return { ok: true };
       }
