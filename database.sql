@@ -409,10 +409,10 @@ begin
 end;
 $$;
 
--- Record one successful transfer: bump the daily transfer counter (window starts
--- on the first transfer) and decrement the total/per-pattern bot counters — the
--- bot has left the account, same effect as a deletion (minus the 24h-creations
--- decrement, since the creation still happened).
+-- Record one successful transfer: bump the daily transfer counter (the 24h
+-- window extends from the LATEST transfer) and decrement the total/per-pattern
+-- bot counters — the bot has left the account, same effect as a deletion
+-- (minus the 24h-creations decrement, since the creation still happened).
 create or replace function register_bot_transfer(
   account_phone text,
   bot_pattern text default 'default'
@@ -423,7 +423,7 @@ as $$
 begin
   update telegram_accounts
   set bots_transferred_24h = bots_transferred_24h + 1,
-      transfers_next_reset = coalesce(transfers_next_reset, now() + interval '24 hours'),
+      transfers_next_reset = now() + interval '24 hours',
       bots_count = greatest(bots_count - 1, 0),
       default_bots_count = greatest(default_bots_count - (case when bot_pattern = 'default' then 1 else 0 end), 0),
       crypto_bots_count = greatest(crypto_bots_count - (case when bot_pattern = 'crypto' then 1 else 0 end), 0)

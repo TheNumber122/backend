@@ -2651,6 +2651,15 @@ router.post("/bots/transfer/preview", async (req: Request, res: Response) => {
       groupedByOwner[phone].push(bot);
     }
 
+    // Per-owner remaining transfer capacity (3/24h minus already used).
+    const remainingByOwner: Record<string, number> = {};
+    for (const phone of Object.keys(groupedByOwner)) {
+      const { data: limits } = await supabase.rpc("check_transfer_limits", { account_phone: phone });
+      remainingByOwner[phone] = limits?.can_transfer === false
+        ? 0
+        : Math.max(0, 3 - (limits?.bots_transferred_24h ?? 0));
+    }
+
     return res.json({
       success: true,
       data: {
@@ -2664,6 +2673,7 @@ router.post("/bots/transfer/preview", async (req: Request, res: Response) => {
         })),
         totalCount: matched.length,
         groupedByOwner,
+        remainingByOwner,
       },
     });
   } catch (err: any) {

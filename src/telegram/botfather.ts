@@ -530,19 +530,24 @@ export async function transferBotViaBotFather(
       }
       log(`BotFather → click "${sureBtn.text}"`);
       await sleep(CLICK_DELAY);
+      const pwdFail = (msg: string): TransferBotResult =>
+        ({ ok: false, reason: password ? "bad_password" : "needs_password", message: msg });
       try {
-        await client.getCallbackAnswer({
+        const answer = await client.getCallbackAnswer({
           message: reply,
           data: sureBtn.data,
           password,
           timeout: 15000,
         });
+        // BotFather may reject via a callback alert instead of an RPC error.
+        const alert = String(answer?.message || "");
+        if (/password|two-step|2fa/i.test(alert)) return pwdFail(alert);
       } catch (e: any) {
         const m = String(e?.message || e);
-        if (/PASSWORD_HASH_INVALID/.test(m)) return { ok: false, reason: "bad_password", message: m };
-        if (/PASSWORD_MISSING|PASSWORD_EMPTY|SRP/.test(m)) return { ok: false, reason: "needs_password", message: m };
         const fresh = m.match(/(?:PASSWORD|SESSION)_TOO_FRESH_(\d+)/);
         if (fresh) return { ok: false, reason: "flood", message: m, retryAfter: parseInt(fresh[1], 10) };
+        if (/PASSWORD_HASH_INVALID/.test(m)) return { ok: false, reason: "bad_password", message: m };
+        if (/password|srp|two-step/i.test(m)) return pwdFail(m);
         if (!isTimeoutErr(e)) return { ok: false, reason: "error", message: m };
       }
       reply = await waitForNextStep(conv, reply);
@@ -550,6 +555,7 @@ export async function transferBotViaBotFather(
 
       // Step 6: verdict
       const t2 = (reply.text || "").toLowerCase();
+      if (/password|two-step|2fa/.test(t2)) return pwdFail(reply.text);
       if (/it worked|success|transferred|congratulations|new owner/.test(t2)) {
         log(`Bot @${botUsername} transferred to ${recipientHandle}.`, "success");
         return { ok: true };
