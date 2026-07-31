@@ -20,7 +20,7 @@ export type BotFatherResult =
   | { ok: true; token: string; username: string; tried: string[] }
   | {
       ok: false;
-      reason: "limit" | "flood" | "timeout" | "no_username" | "error";
+      reason: "limit" | "flood" | "timeout" | "no_username" | "spam_block" | "error";
       message: string;
       tried: string[];
       // For "flood": the exact number of seconds BotFather told us to wait, if it
@@ -29,6 +29,14 @@ export type BotFatherResult =
     };
 
 const TOKEN_RE = /(\d{8,10}:[A-Za-z0-9_-]{35})/;
+
+// Spam-restricted accounts get this on /newbot. The block lasts days, not
+// minutes — surfaced as a flood with a 24h retry so the scheduler parks it.
+const SPAM_BLOCK_RE = /cannot create new bots at this time|contact @spambot/i;
+// BotFather's generic help ("I can help you create and manage Telegram bots...")
+// means NO wizard is active — our flow is out of sync. Bail instead of burning
+// every candidate against a dead conversation.
+const HELP_RE = /i can help you create and manage telegram bots/i;
 
 // BotFather flood replies often name a delay, e.g.
 //   "Sorry, too many attempts. Please try again in 129 seconds."
@@ -62,8 +70,9 @@ function isTimeoutErr(e: any): boolean {
 
 function classifyUsernameReply(
   text: string
-): "success" | "taken" | "invalid" | "limit" | "flood" | "unknown" {
+): "success" | "taken" | "invalid" | "limit" | "flood" | "help" | "unknown" {
   if (TOKEN_RE.test(text)) return "success";
+  if (HELP_RE.test(text)) return "help";
   const t = text.toLowerCase();
   if (/already taken|is already in use|already exists/.test(t)) return "taken";
   if (
@@ -84,7 +93,9 @@ function classifyUsernameReply(
 
 function classifyPreUsernameReply(
   text: string
-): "ask_username" | "ask_name" | "limit" | "flood" | "unknown" {
+): "ask_username" | "ask_name" | "limit" | "flood" | "spam_block" | "help" | "unknown" {
+  if (SPAM_BLOCK_RE.test(text)) return "spam_block";
+  if (HELP_RE.test(text)) return "help";
   const t = text.toLowerCase();
   if (
     /too many bots|maximum number of bots|(can'?t|cannot) add more than|delete one of your bots|20 bots|40 bots/.test(
@@ -109,12 +120,26 @@ export async function createBotViaBotFather(
 
   try {
     return await conv.with(async () => {
+      // 0. Reset any half-open wizard left over from a killed/aborted run —
+      // otherwise our "name" message gets eaten by the stale prompt and the
+      // whole flow desyncs. /cancel is a no-op when nothing is active.
+      log("BotFather → /cancel (reset state)");
+      await conv.sendText("/cancel");
+      try {
+        await conv.waitForResponse(undefined, { timeout: 10000 });
+      } catch (e) {
+        if (!isTimeoutErr(e)) throw e; // no reply to /cancel is fine
+      }
+      await sleep(SEND_DELAY);
+
       // 1. Kick off a new bot.
       log("BotFather → /newbot");
       await conv.sendText("/newbot");
       let reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
       log(`BotFather ⇐ ${short(reply.text)}`);
       let stage = classifyPreUsernameReply(reply.text);
+      if (stage === "spam_block")
+        return { ok: false, reason: "spam_block", message: reply.text, tried };
       if (stage === "limit") return { ok: false, reason: "limit", message: reply.text, tried };
       if (stage === "flood")
         return {
@@ -124,6 +149,13 @@ export async function createBotViaBotFather(
           tried,
           retryAfter: parseRetrySeconds(reply.text),
         };
+      if (stage === "help" || stage === "unknown")
+        return {
+          ok: false,
+          reason: "error",
+          message: `Unexpected reply to /newbot: ${short(reply.text)}`,
+          tried,
+        };
 
       // 2. Provide the display name (BotFather then asks for a username).
       log(`BotFather → name: "${displayName}"`);
@@ -132,6 +164,8 @@ export async function createBotViaBotFather(
       reply = await conv.waitForResponse(undefined, { timeout: STEP_TIMEOUT });
       log(`BotFather ⇐ ${short(reply.text)}`);
       stage = classifyPreUsernameReply(reply.text);
+      if (stage === "spam_block")
+        return { ok: false, reason: "spam_block", message: reply.text, tried };
       if (stage === "limit") return { ok: false, reason: "limit", message: reply.text, tried };
       if (stage === "flood")
         return {
@@ -140,6 +174,13 @@ export async function createBotViaBotFather(
           message: reply.text,
           tried,
           retryAfter: parseRetrySeconds(reply.text),
+        };
+      if (stage === "help")
+        return {
+          ok: false,
+          reason: "error",
+          message: `Wizard lost after sending name (got help text): ${short(reply.text)}`,
+          tried,
         };
 
       // 3. Try usernames until one is accepted or we run out.
@@ -156,6 +197,13 @@ export async function createBotViaBotFather(
           const token = reply.text.match(TOKEN_RE)?.[1] ?? "";
           return { ok: true, token, username, tried };
         }
+        if (verdict === "help")
+          return {
+            ok: false,
+            reason: "error",
+            message: `Wizard lost mid-flow (got help text): ${short(reply.text)}`,
+            tried,
+          };
         if (verdict === "limit") return { ok: false, reason: "limit", message: reply.text, tried };
         if (verdict === "flood")
           return {

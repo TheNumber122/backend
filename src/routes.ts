@@ -359,6 +359,10 @@ function backoffForBotFailure(res: SingleBotResult): {
     return { ms: BOT_FLOOD_BACKOFF_MS, detail: "flood (no time given)" };
   }
   if (res.status === "no_username") return { ms: BOT_COOLDOWN_MS, detail: "name collisions" };
+  // Spam-blocked accounts stay blocked for days — park 24h so we don't ping
+  // BotFather (and burn usernames) every 5 minutes.
+  if (res.status === "spam_block")
+    return { ms: 24 * 60 * 60 * 1000, detail: "account spam-blocked (@SpamBot) → parked 24h" };
   // timeout / error / anything unexpected → conservative fixed back-off.
   return { ms: BOT_ERROR_BACKOFF_MS, detail: res.status };
 }
@@ -1705,7 +1709,7 @@ async function createGroupsInner(
 }
 
 interface SingleBotResult {
-  status: "created" | "limit" | "flood" | "timeout" | "error" | "no_username";
+  status: "created" | "limit" | "flood" | "timeout" | "error" | "no_username" | "spam_block";
   username?: string;
   // When status is "flood" and BotFather named a delay, this is that delay in ms.
   retryAfterMs?: number;
