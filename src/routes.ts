@@ -379,9 +379,12 @@ function sleep(ms: number) {
 // Park a job until `nextAt`, UNLESS that wait exceeds MAX_PARK_MS — then close
 // it as failed right away (user policy: no job sits "processing" for hours on a
 // wait it can't act on). Progress fields are preserved; re-enqueue resumes.
+// Closing also stamps the account's flood_wait_until so the account selector
+// shows it as unavailable until the wait actually elapses.
 // Returns the human label used in the caller's log line.
 async function parkOrFail(
   jobId: number,
+  phone: string,
   waitMs: number,
   reason: string,
   extra: Record<string, any>,
@@ -398,10 +401,16 @@ async function parkOrFail(
         ...extra,
       })
       .eq("id", jobId);
+    // The job is gone but the account is still blocked — mark it unavailable so
+    // the account selector doesn't offer it before the wait is over.
+    await supabase
+      .from("telegram_accounts")
+      .update({ flood_wait_until: new Date(Date.now() + waitMs).toISOString() })
+      .eq("phone", phone);
     log(
       `Job #${jobId} closed as failed — ${reason}; retry would be in ~${Math.round(
         waitMs / 60000
-      )} min (> ${Math.round(MAX_PARK_MS / 60000)} min policy). Re-enqueue to resume.`,
+      )} min (> ${Math.round(MAX_PARK_MS / 60000)} min policy). Account ${phone} marked unavailable until then. Re-enqueue to resume.`,
       "error"
     );
     return "failed";
@@ -674,6 +683,7 @@ async function runOneBotStep(job: any) {
         : Date.now() + 24 * 60 * 60 * 1000;
       const outcome = await parkOrFail(
         job.id,
+        job.phone,
         resetAt - Date.now(),
         "3-per-24h bot limit",
         {},
@@ -776,6 +786,7 @@ async function runOneBotStep(job: any) {
   const { ms: backoff, detail } = backoffForBotFailure(res);
   const outcome = await parkOrFail(
     job.id,
+    job.phone,
     backoff,
     `${res.status}: ${detail}`,
     { bots_attempts: newFailures },
@@ -993,6 +1004,7 @@ async function runOneTransferStep(job: any) {
       : Date.now() + 24 * 60 * 60 * 1000;
     const outcome = await parkOrFail(
       job.id,
+      job.phone,
       resetAt - Date.now(),
       "3-per-24h transfer limit",
       {},
@@ -1119,6 +1131,7 @@ async function runOneTransferStep(job: any) {
   });
   const outcome = await parkOrFail(
     job.id,
+    job.phone,
     backoff,
     `${result.reason}: ${detail}`,
     { bots_attempts: failures },
@@ -1333,8 +1346,16 @@ async function recoverOrphanedJobs(immediate = false) {
       .in("type", ["bot", "bot_transfer"])
       .in("status", ["pending", "processing"])
       .gt("next_attempt_at", horizon)
-      .select("id, phone");
+      .select("id, phone, next_attempt_at");
     if (closed && closed.length) {
+      // Keep the selector honest: the accounts are still blocked until their
+      // (now-discarded) next_attempt_at, so mirror it into flood_wait_until.
+      for (const r of closed as any[]) {
+        await supabase
+          .from("telegram_accounts")
+          .update({ flood_wait_until: r.next_attempt_at })
+          .eq("phone", r.phone);
+      }
       broadcastLog({
         message: `Closed ${closed.length} long-parked bot job(s) (next attempt > ${Math.round(
           MAX_PARK_MS / 60000
