@@ -324,6 +324,11 @@ const BOT_FLOOD_MAX_MS = 6 * 60 * 60 * 1000;
 const SCHEDULER_MAX_SLEEP_MS = 60 * 1000;
 // Give up on a bot job after this many failed attempts (per job) to avoid loops.
 const MAX_BOT_FAILURES = 12;
+// Policy: a bot/transfer job whose next attempt is further away than this is not
+// worth keeping open (daily cap ≈ 24h, spam block = 24h, long floods). The
+// scheduler closes it as failed instead of leaving it "processing" for a day;
+// progress (bots_done) is preserved and a new job can be enqueued anytime.
+const MAX_PARK_MS = Number(process.env.MAX_PARK_MS) || 60 * 60 * 1000;
 // Self-healing tick: the scheduler is otherwise only kicked on boot and on each
 // enqueue, so a single transient error (or an early return on a DB hiccup) used
 // to strand every remaining job until the next enqueue — which never comes after
@@ -369,6 +374,47 @@ function backoffForBotFailure(res: SingleBotResult): {
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Park a job until `nextAt`, UNLESS that wait exceeds MAX_PARK_MS — then close
+// it as failed right away (user policy: no job sits "processing" for hours on a
+// wait it can't act on). Progress fields are preserved; re-enqueue resumes.
+// Returns the human label used in the caller's log line.
+async function parkOrFail(
+  jobId: number,
+  waitMs: number,
+  reason: string,
+  extra: Record<string, any>,
+  log: (message: string, type?: "info" | "success" | "error") => void
+): Promise<"parked" | "failed"> {
+  if (waitMs > MAX_PARK_MS) {
+    await supabase
+      .from("group_creation_queue")
+      .update({
+        status: "failed",
+        completed_at: new Date().toISOString(),
+        next_attempt_at: null,
+        error_message: `Closed: next attempt was ${Math.round(waitMs / 60000)} min away (${reason}). Re-enqueue to resume.`,
+        ...extra,
+      })
+      .eq("id", jobId);
+    log(
+      `Job #${jobId} closed as failed — ${reason}; retry would be in ~${Math.round(
+        waitMs / 60000
+      )} min (> ${Math.round(MAX_PARK_MS / 60000)} min policy). Re-enqueue to resume.`,
+      "error"
+    );
+    return "failed";
+  }
+  await supabase
+    .from("group_creation_queue")
+    .update({
+      next_attempt_at: new Date(Date.now() + waitMs).toISOString(),
+      status: "processing",
+      ...extra,
+    })
+    .eq("id", jobId);
+  return "parked";
 }
 
 // The single queue scheduler. Each iteration runs one "unit" of work:
@@ -621,19 +667,25 @@ async function runOneBotStep(job: any) {
       return;
     }
     if (limits.reason === "daily") {
-      // Park this account until its 24h window resets; other accounts run meanwhile.
+      // 24h window reset is always > MAX_PARK_MS away → close the job instead
+      // of leaving it "processing" for a day (policy: no long-parked jobs).
       const resetAt = limits.next_reset
-        ? new Date(limits.next_reset).toISOString()
-        : new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-      await supabase
-        .from("group_creation_queue")
-        .update({ next_attempt_at: resetAt, status: "processing" })
-        .eq("id", job.id);
-      log(
-        `Account ${job.phone} hit the 3-per-24h bot limit. Next bot after ${new Date(
-          resetAt
-        ).toLocaleString()}.`
+        ? new Date(limits.next_reset).getTime()
+        : Date.now() + 24 * 60 * 60 * 1000;
+      const outcome = await parkOrFail(
+        job.id,
+        resetAt - Date.now(),
+        "3-per-24h bot limit",
+        {},
+        log
       );
+      if (outcome === "parked") {
+        log(
+          `Account ${job.phone} hit the 3-per-24h bot limit. Next bot after ${new Date(
+            resetAt
+          ).toLocaleString()}.`
+        );
+      }
       return;
     }
   }
@@ -722,11 +774,14 @@ async function runOneBotStep(job: any) {
   }
 
   const { ms: backoff, detail } = backoffForBotFailure(res);
-  const nextAt = new Date(Date.now() + backoff).toISOString();
-  await supabase
-    .from("group_creation_queue")
-    .update({ bots_attempts: newFailures, next_attempt_at: nextAt, status: "processing" })
-    .eq("id", job.id);
+  const outcome = await parkOrFail(
+    job.id,
+    backoff,
+    `${res.status}: ${detail}`,
+    { bots_attempts: newFailures },
+    log
+  );
+  if (outcome === "failed") return;
   const mins = backoff / 60000;
   const human = mins >= 1 ? `~${Math.round(mins)} min` : `~${Math.round(backoff / 1000)}s`;
   log(
@@ -934,17 +989,22 @@ async function runOneTransferStep(job: any) {
   });
   if (limits && limits.can_transfer === false) {
     const resetAt = limits.next_reset
-      ? new Date(limits.next_reset).toISOString()
-      : new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-    await supabase
-      .from("group_creation_queue")
-      .update({ next_attempt_at: resetAt, status: "processing" })
-      .eq("id", job.id);
-    log(
-      `Account ${job.phone} hit the 3-per-24h transfer limit. Next transfer after ${new Date(
-        resetAt
-      ).toLocaleString()}. (${done}/${total} done)`
+      ? new Date(limits.next_reset).getTime()
+      : Date.now() + 24 * 60 * 60 * 1000;
+    const outcome = await parkOrFail(
+      job.id,
+      resetAt - Date.now(),
+      "3-per-24h transfer limit",
+      {},
+      log
     );
+    if (outcome === "parked") {
+      log(
+        `Account ${job.phone} hit the 3-per-24h transfer limit. Next transfer after ${new Date(
+          resetAt
+        ).toLocaleString()}. (${done}/${total} done)`
+      );
+    }
     return;
   }
 
@@ -1057,11 +1117,14 @@ async function runOneTransferStep(job: any) {
     status: result.reason as "flood" | "timeout" | "error",
     retryAfterMs: result.reason === "flood" && result.retryAfter ? result.retryAfter * 1000 : undefined,
   });
-  const nextAt = new Date(Date.now() + backoff).toISOString();
-  await supabase
-    .from("group_creation_queue")
-    .update({ bots_attempts: failures, next_attempt_at: nextAt, status: "processing" })
-    .eq("id", job.id);
+  const outcome = await parkOrFail(
+    job.id,
+    backoff,
+    `${result.reason}: ${detail}`,
+    { bots_attempts: failures },
+    log
+  );
+  if (outcome === "failed") return;
   log(
     `Transfer attempt for ${job.phone} did not succeed (${result.reason}: ${detail}). ` +
       `Retrying in ~${Math.round(backoff / 60000)} min. [${failures}/${MAX_BOT_FAILURES} failures]`,
@@ -1254,6 +1317,36 @@ const ORPHAN_STALE_MS = Number(process.env.ORPHAN_STALE_MS) || 2 * 60 * 60 * 100
 // may legitimately hold a job in processing for up to ~1h during an inline flood
 // wait. bots_done is never cleared, so progress survives the reset.
 async function recoverOrphanedJobs(immediate = false) {
+  // Enforce the no-long-parks policy on jobs parked BEFORE this policy existed
+  // (or by any path that slips through): any open bot/transfer job whose next
+  // attempt is further than MAX_PARK_MS away gets closed as failed. Runs on
+  // boot and every tick; matches at most a handful of rows, so it's cheap.
+  try {
+    const horizon = new Date(Date.now() + MAX_PARK_MS).toISOString();
+    const { data: closed } = await supabase
+      .from("group_creation_queue")
+      .update({
+        status: "failed",
+        completed_at: new Date().toISOString(),
+        error_message: `Closed: next attempt was more than ${Math.round(MAX_PARK_MS / 60000)} min away. Re-enqueue to resume.`,
+      })
+      .in("type", ["bot", "bot_transfer"])
+      .in("status", ["pending", "processing"])
+      .gt("next_attempt_at", horizon)
+      .select("id, phone");
+    if (closed && closed.length) {
+      broadcastLog({
+        message: `Closed ${closed.length} long-parked bot job(s) (next attempt > ${Math.round(
+          MAX_PARK_MS / 60000
+        )} min away): ${closed.map((r: any) => `#${r.id} ${r.phone}`).join(", ")}. Re-enqueue to resume.`,
+        type: "info",
+        timestamp: new Date().toISOString(),
+      });
+    }
+  } catch {
+    /* best-effort; next tick retries */
+  }
+
   try {
     let query = supabase
       .from("group_creation_queue")
