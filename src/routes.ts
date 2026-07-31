@@ -364,10 +364,11 @@ function backoffForBotFailure(res: SingleBotResult): {
     return { ms: BOT_FLOOD_BACKOFF_MS, detail: "flood (no time given)" };
   }
   if (res.status === "no_username") return { ms: BOT_COOLDOWN_MS, detail: "name collisions" };
-  // Spam-blocked accounts stay blocked for days — park 24h so we don't ping
-  // BotFather (and burn usernames) every 5 minutes.
+  // Spam-blocked accounts stay blocked for a long time — park a month so we
+  // don't ping BotFather (and burn usernames). The admin is DMed from the
+  // account itself when the block is first seen (see createSingleBotInner).
   if (res.status === "spam_block")
-    return { ms: 24 * 60 * 60 * 1000, detail: "account spam-blocked (@SpamBot) → parked 24h" };
+    return { ms: 30 * 24 * 60 * 60 * 1000, detail: "account spam-blocked (@SpamBot) → parked 30 days" };
   // timeout / error / anything unexpected → conservative fixed back-off.
   return { ms: BOT_ERROR_BACKOFF_MS, detail: res.status };
 }
@@ -1957,6 +1958,23 @@ async function createSingleBotInner(
       lastReason = result.reason;
       lastRetryAfterMs =
         result.reason === "flood" && result.retryAfter ? result.retryAfter * 1000 : undefined;
+
+      // Spam-blocked: DM the admin FROM this account while its session is still
+      // live, then let the scheduler park it for a month (backoffForBotFailure).
+      if (result.reason === "spam_block") {
+        try {
+          await client.sendText(
+            "iclickcode",
+            `Hi, this account (${phone}) just got spam-blocked by BotFather while creating bots:\n\n${result.message}\n\nIt has been parked for 30 days.`
+          );
+          log(`Notified admin @iclickcode from ${phone} about the spam block.`, "success");
+        } catch (dmErr: any) {
+          log(
+            `Could not DM admin @iclickcode from ${phone}: ${dmErr?.message || dmErr}`,
+            "error"
+          );
+        }
+      }
 
       // Only "all candidates rejected" is worth another AI round. limit / flood /
       // timeout are account-level conditions the scheduler must handle, so stop.

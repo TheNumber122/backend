@@ -31,7 +31,7 @@ export type BotFatherResult =
 const TOKEN_RE = /(\d{8,10}:[A-Za-z0-9_-]{35})/;
 
 // Spam-restricted accounts get this on /newbot. The block lasts days, not
-// minutes — surfaced as a flood with a 24h retry so the scheduler parks it.
+// minutes — the caller DMs the admin and the scheduler parks the account 30d.
 const SPAM_BLOCK_RE = /cannot create new bots at this time|contact @spambot/i;
 // BotFather's generic help ("I can help you create and manage Telegram bots...")
 // means NO wizard is active — our flow is out of sync. Bail instead of burning
