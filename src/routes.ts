@@ -382,6 +382,10 @@ function sleep(ms: number) {
 // wait it can't act on). Progress fields are preserved; re-enqueue resumes.
 // Closing also stamps the account's flood_wait_until so the account selector
 // shows it as unavailable until the wait actually elapses.
+// `extra.forcePark` is a caller-controlled flag (NOT a DB column) that bypasses
+// the MAX_PARK_MS policy for deliberate long parks (e.g. 30-day spam blocks).
+// Forced parks also stamp the account's flood_wait_until so the account
+// selector shows it unavailable for the full wait.
 // Returns the human label used in the caller's log line.
 async function parkOrFail(
   jobId: number,
@@ -391,7 +395,10 @@ async function parkOrFail(
   extra: Record<string, any>,
   log: (message: string, type?: "info" | "success" | "error") => void
 ): Promise<"parked" | "failed"> {
-  if (waitMs > MAX_PARK_MS) {
+  // Pull forcePark out of extra so it never gets written as a DB column.
+  const { forcePark, ...dbExtra } = extra;
+
+  if (waitMs > MAX_PARK_MS && !forcePark) {
     await supabase
       .from("group_creation_queue")
       .update({
@@ -399,7 +406,7 @@ async function parkOrFail(
         completed_at: new Date().toISOString(),
         next_attempt_at: null,
         error_message: `Closed: next attempt was ${Math.round(waitMs / 60000)} min away (${reason}). Re-enqueue to resume.`,
-        ...extra,
+        ...dbExtra,
       })
       .eq("id", jobId);
     // The job is gone but the account is still blocked — mark it unavailable so
@@ -416,14 +423,26 @@ async function parkOrFail(
     );
     return "failed";
   }
+
+  // Park the job — either within policy, or force-parked past the policy limit.
+  const nextAt = new Date(Date.now() + waitMs).toISOString();
   await supabase
     .from("group_creation_queue")
     .update({
-      next_attempt_at: new Date(Date.now() + waitMs).toISOString(),
+      next_attempt_at: nextAt,
       status: "processing",
-      ...extra,
+      // Marker so recoverOrphanedJobs skips genuinely long-parked jobs.
+      ...(forcePark ? { error_message: `Force-parked: ${reason}` } : {}),
+      ...dbExtra,
     })
     .eq("id", jobId);
+  // Forced (long) parks also block the account in the selector.
+  if (forcePark) {
+    await supabase
+      .from("telegram_accounts")
+      .update({ flood_wait_until: nextAt })
+      .eq("phone", phone);
+  }
   return "parked";
 }
 
@@ -765,9 +784,12 @@ async function runOneBotStep(job: any) {
     return;
   }
 
-  // flood / timeout / error / no_username → back off and retry later, up to a cap.
+  // flood / timeout / spam_block / no_username → back off and retry later.
   const newFailures = failures + 1;
-  if (newFailures >= MAX_BOT_FAILURES) {
+  // Spam-blocked accounts are parked for 30 days on purpose — that's not a
+  // "failure" that should ever hit MAX_BOT_FAILURES and give up the job.
+  const isSpamBlock = res.status === "spam_block";
+  if (!isSpamBlock && newFailures >= MAX_BOT_FAILURES) {
     await supabase
       .from("group_creation_queue")
       .update({
@@ -790,7 +812,7 @@ async function runOneBotStep(job: any) {
     job.phone,
     backoff,
     `${res.status}: ${detail}`,
-    { bots_attempts: newFailures },
+    { bots_attempts: newFailures, ...(isSpamBlock ? { forcePark: true } : {}) },
     log
   );
   if (outcome === "failed") return;
@@ -798,7 +820,7 @@ async function runOneBotStep(job: any) {
   const human = mins >= 1 ? `~${Math.round(mins)} min` : `~${Math.round(backoff / 1000)}s`;
   log(
     `Bot attempt for ${job.phone} did not succeed (${res.status}: ${detail}). ` +
-      `Retrying in ${human}. [${newFailures}/${MAX_BOT_FAILURES} failures]`,
+      `${isSpamBlock ? "Parked for 30 days." : `Retrying in ${human}.`} [${newFailures}/${MAX_BOT_FAILURES} failures]`,
     "error"
   );
 }
@@ -1347,6 +1369,10 @@ async function recoverOrphanedJobs(immediate = false) {
       .in("type", ["bot", "bot_transfer"])
       .in("status", ["pending", "processing"])
       .gt("next_attempt_at", horizon)
+      // Skip force-parked jobs (e.g. 30-day spam blocks) — those are parked on
+      // purpose past MAX_PARK_MS and must not be closed by the reaper. NULL
+      // error_message (legacy orphaned jobs) is still reaped.
+      .or("error_message.is.null,error_message.not.ilike.Force-parked%")
       .select("id, phone, next_attempt_at");
     if (closed && closed.length) {
       // Keep the selector honest: the accounts are still blocked until their
