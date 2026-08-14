@@ -28,8 +28,12 @@ export const UPLOADS_DIR = path.join(__dirname, "..", "uploads");
 // Only channels created by accounts in THIS workspace get recorded into the
 // sister project's protected_channels table (so its auto-leave bot skips them).
 // Friends' channels are never recorded. Override via env if the name changes.
+// The backend workspace defaults to "default" when no workspace key is
+// configured. Keep that as the safe default so the primary workspace's channel
+// creations are protected out of the box; friends can use another workspace
+// explicitly via WORKSPACE_KEYS + this setting.
 const PROTECTED_CHANNELS_WORKSPACE =
-  process.env.PROTECTED_CHANNELS_WORKSPACE || "me";
+  process.env.PROTECTED_CHANNELS_WORKSPACE || "default";
 
 // Queue processor
 let isProcessingQueue = false;
@@ -1654,7 +1658,11 @@ async function createGroupsInner(
           // the sister project. (Megagroups are already skipped by the bot's
           // megagroup !== true filter.)
           if (type === "channel" && workspace === PROTECTED_CHANNELS_WORKSPACE) {
-            await recordProtectedChannel(phone, chat.id, title);
+            const protectedOk = await recordProtectedChannel(phone, chat.id, title);
+            if (!protectedOk) {
+              groupResult.protectionError =
+                "Channel was created, but protected_channels sync failed";
+            }
           }
 
           const msgError = await sendMessagesToGroup(
@@ -2058,47 +2066,71 @@ async function createSingleGroup(
   return null;
 }
 
+// Mtcute's high-level Chat.id is a marked id (-1000000000000 - bare id),
+// while the auto-leave worker compares GramJS's bare positive channel id. The
+// createChannel helper below currently returns raw MTProto chats (already bare),
+// but normalizing here also makes backfill/future callers safe.
+function toBareChannelId(channelId: any): string {
+  const id = BigInt(String(channelId));
+  const channelMark = BigInt("-1000000000000");
+  return (id < channelMark ? channelMark - id : id).toString();
+}
+
 // Record a channel we created into the external auto-leave bot's Supabase so it
-// never leaves it. `channelId` is the BARE Telegram channel id (matches GramJS
-// entity.id on the bot side). Best-effort: failures are logged, never thrown.
+// never leaves it. Retries make transient external-DB failures recoverable while
+// the timeout prevents a broken sister project from stalling the queue.
 async function recordProtectedChannel(
   phone: string,
   channelId: any,
   title: string
-): Promise<void> {
-  if (!protectedDb) return; // Not configured — skip silently.
-  try {
-    // Never let a slow/hanging external DB stall channel creation or the queue:
-    // supabase-js has no built-in timeout, so cap the write ourselves.
-    const upsert = protectedDb
-      .from("protected_channels")
-      .upsert(
-        { channel_id: String(channelId), phone, title },
-        { onConflict: "channel_id" }
-      );
-    const timeout = new Promise<{ error: { message: string } }>((resolve) =>
-      setTimeout(
-        () => resolve({ error: { message: "timed out after 10s" } }),
-        10000
-      )
-    );
-    const { error } = await Promise.race([upsert, timeout]);
-    if (error) {
-      broadcastLog({
-        message: `Could not record protected channel ${title}: ${error.message}`,
-        type: "error",
-        timestamp: new Date().toISOString(),
-      });
-    }
-  } catch (err: any) {
+): Promise<boolean> {
+  if (!protectedDb) {
     broadcastLog({
-      message: `Could not record protected channel ${title}: ${
-        err?.message || "Unknown error"
-      }`,
+      message: `Protected-channel sync is disabled; could not record ${title}.`,
       type: "error",
       timestamp: new Date().toISOString(),
     });
+    return false;
   }
+
+  let lastError = "Unknown error";
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // Never let a slow/hanging external DB stall channel creation or the queue:
+      // supabase-js has no built-in timeout, so cap the write ourselves.
+      const upsert = protectedDb
+        .from("protected_channels")
+        .upsert(
+          { channel_id: toBareChannelId(channelId), phone, title },
+          { onConflict: "channel_id" }
+        );
+      const timeout = new Promise<{ error: { message: string } }>((resolve) => {
+        timer = setTimeout(
+          () => resolve({ error: { message: "timed out after 10s" } }),
+          10000
+        );
+      });
+      const { error } = await Promise.race([upsert, timeout]);
+      if (!error) return true;
+      lastError = error.message;
+    } catch (err: any) {
+      lastError = err?.message || "Unknown error";
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+
+    if (attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+    }
+  }
+
+  broadcastLog({
+    message: `Could not record protected channel ${title}: ${lastError}`,
+    type: "error",
+    timestamp: new Date().toISOString(),
+  });
+  return false;
 }
 
 // Helper: send messages to a newly created group, returns error string or null
@@ -2401,6 +2433,103 @@ router.post("/groups/create", async (req: Request, res: Response) => {
     return res.status(500).json({
       success: false,
       error: err.message || "An unexpected error occurred",
+    });
+  }
+});
+
+// Backfill channels created before protected-channel sync was fixed. This is
+// intentionally explicit rather than running on every boot: it can inspect many
+// Telegram dialogs and should only run for the owning workspace.
+router.post("/channels/protect-existing", async (req: Request, res: Response) => {
+  const ws = getWorkspace(req);
+  if (ws !== PROTECTED_CHANNELS_WORKSPACE) {
+    return res.status(403).json({
+      success: false,
+      error: "Protected-channel backfill is only available to the owning workspace.",
+    });
+  }
+  if (!protectedDb) {
+    return res.status(503).json({
+      success: false,
+      error:
+        "Protected-channel sync is not configured. Set OTHER_SUPABASE_URL and " +
+        "OTHER_SUPABASE_SERVICE_ROLE_KEY.",
+    });
+  }
+
+  try {
+    const { data: accounts, error: accountsError } = await supabase
+      .from("telegram_accounts")
+      .select("phone")
+      .eq("workspace", ws)
+      .order("phone");
+    if (accountsError) throw accountsError;
+
+    let discovered = 0;
+    let saved = 0;
+    let failed = 0;
+    const accountResults: Array<Record<string, any>> = [];
+
+    for (const account of accounts || []) {
+      let client: any = null;
+      let accountDiscovered = 0;
+      let accountSaved = 0;
+      let accountFailed = 0;
+      try {
+        await withAccountLock(async () => {
+          client = await getClientByPhone(account.phone);
+          const channels = await listChatsForAccount(client, "channel");
+          accountDiscovered = channels.length;
+          for (const channel of channels) {
+            // `raw.id` is the bare MTProto channel id. Fall back to the
+            // high-level id because toBareChannelId handles both forms.
+            const channelId = channel.peer?.raw?.id ?? channel.id;
+            if (await recordProtectedChannel(account.phone, channelId, channel.title)) {
+              accountSaved++;
+            } else {
+              accountFailed++;
+            }
+          }
+        });
+      } catch (err: any) {
+        accountFailed += accountDiscovered || 1;
+        broadcastLog({
+          message: `Protected-channel backfill failed for ${account.phone}: ${
+            err?.message || "Unknown error"
+          }`,
+          type: "error",
+          timestamp: new Date().toISOString(),
+        });
+      } finally {
+        if (client) {
+          try {
+            await clearSession(account.phone);
+          } catch (_) {}
+        }
+      }
+
+      discovered += accountDiscovered;
+      saved += accountSaved;
+      failed += accountFailed;
+      accountResults.push({
+        phone: account.phone,
+        discovered: accountDiscovered,
+        saved: accountSaved,
+        failed: accountFailed,
+      });
+    }
+
+    return res.json({
+      success: failed === 0,
+      discovered,
+      saved,
+      failed,
+      accounts: accountResults,
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      error: err?.message || "Failed to backfill protected channels",
     });
   }
 });
