@@ -7,10 +7,12 @@
 // sweep (counter-driven, not random) — so back-to-back batches can't cluster on
 // the same over-farmed words, and we spend no prompt tokens listing rejected names.
 //
-// Groq is OpenAI-compatible. Free tier: 30 req/min, 1K req/day for gpt-oss-120b.
+// Groq is OpenAI-compatible. Compound uses Groq's hosted tools and returns the
+// completed answer from a single request, so it can be used without a local
+// tool-calling loop.
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "gpt-oss-120b";
+const GROQ_MODEL = "groq/compound";
 
 type GenMode = "default" | "crypto" | "custom";
 
@@ -26,7 +28,7 @@ interface GenerateOpts {
 const BUFFER = 5;
 
 // NOTE: `avoid` is used ONLY to de-dupe the OUTPUT (the `skip` Set in
-// callCerebrasOnce) — it is deliberately NOT pasted into the prompt. The rotating
+// callGroqOnce) — it is deliberately NOT pasted into the prompt. The rotating
 // letter constraint (see nextLetter) spreads batches apart without spending
 // tokens narrating rejected names, which used to be the biggest cost driver.
 
@@ -129,6 +131,47 @@ function buildUserPrompt(
     .join("\n");
 }
 
+// Read the assistant text from a Groq SSE response. The API streams JSON events
+// as `data:` lines; only assistant content is relevant to username generation.
+async function readGroqStream(res: Response): Promise<string> {
+  if (!res.body) return "";
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  let content = "";
+
+  const consumeLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) return;
+    const payload = trimmed.slice("data:".length).trim();
+    if (!payload || payload === "[DONE]") return;
+
+    const event = JSON.parse(payload);
+    const choice = event?.choices?.[0];
+    const chunk = choice?.delta?.content ?? choice?.message?.content;
+    if (typeof chunk === "string") content += chunk;
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    pending += decoder.decode(value, { stream: !done });
+    const lines = pending.split(/\r?\n/);
+    pending = lines.pop() ?? "";
+    for (const line of lines) consumeLine(line);
+    if (done) break;
+  }
+  if (pending) consumeLine(pending);
+  return content;
+}
+
+function parseJsonContent(content: string): any {
+  // JSON mode should return a bare object, but stripping a fence makes this
+  // resilient to a model/provider regression without weakening validation below.
+  const normalized = content.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  return JSON.parse(normalized || "{}");
+}
+
 // One Groq request. Returns clean, rule-compliant handles not in `avoid`.
 // Throws on any network/API/parse error so the caller can retry — no fallback.
 async function callGroqOnce(
@@ -144,11 +187,22 @@ async function callGroqOnce(
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${key}`,
+      // Use the current Compound tool set, including visit_website.
+      "Groq-Model-Version": "latest",
     },
     body: JSON.stringify({
       model: GROQ_MODEL,
-      temperature: 0.9,
+      temperature: 1,
+      max_completion_tokens: 2048,
+      top_p: 1,
+      stream: true,
+      stop: null,
       response_format: { type: "json_object" },
+      compound_custom: {
+        tools: {
+          enabled_tools: ["web_search", "code_interpreter", "visit_website"],
+        },
+      },
       messages: [
         {
           role: "system",
@@ -166,12 +220,13 @@ async function callGroqOnce(
   });
 
   if (!res.ok) {
-    throw new Error(`Groq HTTP ${res.status}`);
+    const detail = await res.text().catch(() => "");
+    const suffix = detail ? `: ${detail.slice(0, 300)}` : "";
+    throw new Error(`Groq HTTP ${res.status}${suffix}`);
   }
 
-  const data: any = await res.json();
-  const content = data?.choices?.[0]?.message?.content ?? "{}";
-  const parsed = JSON.parse(content);
+  const content = await readGroqStream(res);
+  const parsed = parseJsonContent(content);
   const list: unknown[] = Array.isArray(parsed?.usernames)
     ? parsed.usernames
     : Array.isArray(parsed)
@@ -194,14 +249,16 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
   const { count, theme, avoid = [], mode = "default" } = opts;
   const key = process.env.GROQ_API_KEY;
 
-  // AI-only: with no key there is nothing to generate. Caller surfaces the error.
-  if (!key) return [];
+  // AI-only: with no key there is nothing to generate. Throw so the route logs
+  // the actual configuration problem instead of reporting an opaque empty batch.
+  if (!key) throw new Error("GROQ_API_KEY is not configured.");
 
   // `seen` starts with the caller's avoid list (handles already rejected by
   // BotFather this run) and grows every round, so each retry asks Groq for
   // words it hasn't given us yet.
   const seen = new Set(avoid);
   const out: string[] = [];
+  let lastError: unknown;
 
   for (let round = 0; round < MAX_ROUNDS && out.length < count; round++) {
     const want = count - out.length + BUFFER;
@@ -213,11 +270,13 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
           out.push(handle);
         }
       }
-    } catch {
-      // Transient network/API error — just try another round.
+    } catch (err) {
+      lastError = err;
+      // Transient network/API error — try another round.
     }
   }
 
+  if (out.length === 0 && lastError) throw lastError;
   return out;
 }
 
