@@ -1934,7 +1934,7 @@ async function createSingleBotInner(
         avoid: rejected, // handles BotFather already refused this run
       });
       if (candidates.length === 0) {
-        log(`No usernames generated for ${phone} (check CEREBRAS_API_KEY / Cerebras status).`, "error");
+        log(`No usernames generated for ${phone} (check GROQ_API_KEY / Groq status).`, "error");
         return { status: "error" };
       }
       const primary = candidates[0];

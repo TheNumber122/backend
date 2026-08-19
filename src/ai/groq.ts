@@ -1,4 +1,4 @@
-// Cerebras-backed generator for Telegram bot usernames. Default mode invents one
+// Groq-backed generator for Telegram bot usernames. Default mode invents one
 // short, pronounceable made-up word + "bot" (e.g. cariovobot) so handles aren't
 // pre-taken; crypto mode prefixes "crypto" onto real English words + bot/robot.
 // NO numbers, NO underscores.
@@ -7,11 +7,10 @@
 // sweep (counter-driven, not random) — so back-to-back batches can't cluster on
 // the same over-farmed words, and we spend no prompt tokens listing rejected names.
 //
-// Cerebras is OpenAI-compatible; we moved off Groq because its free tier ran out
-// of daily requests. Free tier here: 1M tokens/day, 30 req/min (reset 00:00 UTC).
+// Groq is OpenAI-compatible. Free tier: 30 req/min, 1K req/day for gpt-oss-120b.
 
-const CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions";
-const CEREBRAS_MODEL = "gpt-oss-120b";
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_MODEL = "gpt-oss-120b";
 
 type GenMode = "default" | "crypto" | "custom";
 
@@ -43,7 +42,7 @@ function capitalizeFirst(s: string): string {
   return s.length ? s[0].toUpperCase() + s.slice(1) : s;
 }
 
-// Counter-driven letter sweep: each Cerebras call forces the first word to start
+// Counter-driven letter sweep: each Groq call forces the first word to start
 // with the next consonant here, so consecutive batches can't collide on the same
 // over-farmed words. Deterministic (not random) so we cover the space instead of
 // re-landing on the same cluster; vowels and q/x/y/z are dropped because too few
@@ -80,11 +79,11 @@ export function botDisplayName(username: string): string {
   return capitalizeFirst(username);
 }
 
-// How many times we re-ask Cerebras within one generateBotUsernames() call when a
+// How many times we re-ask Groq within one generateBotUsernames() call when a
 // batch comes back too small (duplicates/junk) or a transient API error hits.
 const MAX_ROUNDS = 4;
 
-// Build the user prompt for one Cerebras request. `letter` is the forced first-word
+// Build the user prompt for one Groq request. `letter` is the forced first-word
 // initial for this call (rotating sweep) — it steers the batch off the model's
 // default favorites without any example words or rejected-name lists, keeping the
 // prompt short.
@@ -130,9 +129,9 @@ function buildUserPrompt(
     .join("\n");
 }
 
-// One Cerebras request. Returns clean, rule-compliant handles not in `avoid`.
+// One Groq request. Returns clean, rule-compliant handles not in `avoid`.
 // Throws on any network/API/parse error so the caller can retry — no fallback.
-async function callCerebrasOnce(
+async function callGroqOnce(
   key: string,
   want: number,
   avoid: string[],
@@ -140,14 +139,14 @@ async function callCerebrasOnce(
   theme?: string
 ): Promise<string[]> {
   const letter = nextLetter();
-  const res = await fetch(CEREBRAS_URL, {
+  const res = await fetch(GROQ_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${key}`,
     },
     body: JSON.stringify({
-      model: CEREBRAS_MODEL,
+      model: GROQ_MODEL,
       temperature: 0.9,
       response_format: { type: "json_object" },
       messages: [
@@ -167,7 +166,7 @@ async function callCerebrasOnce(
   });
 
   if (!res.ok) {
-    throw new Error(`Cerebras HTTP ${res.status}`);
+    throw new Error(`Groq HTTP ${res.status}`);
   }
 
   const data: any = await res.json();
@@ -193,13 +192,13 @@ async function callCerebrasOnce(
 
 export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]> {
   const { count, theme, avoid = [], mode = "default" } = opts;
-  const key = process.env.CEREBRAS_API_KEY;
+  const key = process.env.GROQ_API_KEY;
 
   // AI-only: with no key there is nothing to generate. Caller surfaces the error.
   if (!key) return [];
 
   // `seen` starts with the caller's avoid list (handles already rejected by
-  // BotFather this run) and grows every round, so each retry asks Cerebras for
+  // BotFather this run) and grows every round, so each retry asks Groq for
   // words it hasn't given us yet.
   const seen = new Set(avoid);
   const out: string[] = [];
@@ -207,7 +206,7 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
   for (let round = 0; round < MAX_ROUNDS && out.length < count; round++) {
     const want = count - out.length + BUFFER;
     try {
-      const batch = await callCerebrasOnce(key, want, [...seen], mode, theme);
+      const batch = await callGroqOnce(key, want, [...seen], mode, theme);
       for (const handle of batch) {
         if (!seen.has(handle)) {
           seen.add(handle);
@@ -223,7 +222,7 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
 }
 
 // Cross-job candidate pool + known-taken set, both process-lifetime and in-memory
-// (no DB — free Render tier). One Cerebras call yields BATCH names but a single
+// (no DB — free Render tier). One Groq call yields BATCH names but a single
 // bot only consumes a few, so the leftovers are parked in `pool` for the next
 // bot/job instead of burning another request. `tried` remembers every handle
 // already sent to BotFather this process so no later job re-attempts a name we
