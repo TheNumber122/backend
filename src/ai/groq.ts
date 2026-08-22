@@ -1,16 +1,3 @@
-// Groq-backed generator for Telegram bot usernames. Default mode invents one
-// short, pronounceable made-up word + "bot" (e.g. cariovobot) so handles aren't
-// pre-taken; crypto mode prefixes "crypto" onto real English words + bot/robot.
-// NO numbers, NO underscores.
-// AI-only: there is NO local fallback. To fight repetition cheaply, each call
-// forces the first word to start with the next letter in a rotating consonant
-// sweep (counter-driven, not random) — so back-to-back batches can't cluster on
-// the same over-farmed words, and we spend no prompt tokens listing rejected names.
-//
-// Groq is OpenAI-compatible. Compound uses Groq's hosted tools and returns the
-// completed answer from a single request, so it can be used without a local
-// tool-calling loop.
-
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_MODEL = "groq/compound-mini";
 
@@ -18,21 +5,11 @@ type GenMode = "default" | "crypto" | "custom";
 
 interface GenerateOpts {
   count: number;
-  theme?: string; // custom-pattern theme, e.g. "must be about crypto"
-  avoid?: string[]; // handles already tried this run (skip duplicates)
-  mode?: GenMode; // 'crypto' forces start-with-"crypto", end-with bot/robot
+  theme?: string;
+  avoid?: string[];
+  mode?: GenMode;
 }
 
-// NOTE: `avoid` is used ONLY to de-dupe the OUTPUT (the `skip` Set in
-// callGroqOnce) — it is deliberately NOT pasted into the prompt. The rotating
-// letter constraint (see nextLetter) spreads batches apart without spending
-// tokens narrating rejected names, which used to be the biggest cost driver.
-
-// Hard cap on the "word id" portion of the handle — i.e. everything except the
-// literal "crypto" prefix (crypto mode) and the "bot" suffix. Enforced here in
-// code, not just in the prompt, because the model doesn't always respect
-// length instructions (it sometimes truncates/glues words to force a fit,
-// e.g. "lanthem", "pilobot" — this cap + the sanitize check below stop that).
 const MAX_WORD_LEN = 8;
 const MIN_WORD_LEN = 3;
 
@@ -40,11 +17,6 @@ function capitalizeFirst(s: string): string {
   return s.length ? s[0].toUpperCase() + s.slice(1) : s;
 }
 
-// Counter-driven letter sweep: each Groq call forces the first word to start
-// with the next consonant here, so consecutive batches can't collide on the same
-// over-farmed words. Deterministic (not random) so we cover the space instead of
-// re-landing on the same cluster; vowels and q/x/y/z are dropped because too few
-// short, common words start with them.
 const START_LETTERS = "bcdfghjklmnprstvw".split("");
 let letterCursor = 0;
 function nextLetter(): string {
@@ -53,17 +25,13 @@ function nextLetter(): string {
   return letter;
 }
 
-// Turn any model output into a clean, rule-compliant handle or null if unusable.
-// crypto mode: must start with "crypto" and end with "bot" or "robot".
-// Also enforces MAX_WORD_LEN/MIN_WORD_LEN on the word portion (see comment above).
 function sanitize(raw: unknown, mode: GenMode = "default"): string | null {
   if (typeof raw !== "string") return null;
-  let u = raw.toLowerCase().replace(/[^a-z]/g, ""); // letters only, drops @, digits, _
+  let u = raw.toLowerCase().replace(/[^a-z]/g, "");
   if (!u) return null;
   if (mode === "crypto" && !u.startsWith("crypto")) u = "crypto" + u;
-  if (!u.endsWith("bot")) u = u + "bot"; // "robot" also ends with "bot"
+  if (!u.endsWith("bot")) u = u + "bot";
 
-  // Isolate the word id (strip "crypto" prefix and "bot" suffix) and cap it.
   let core = u;
   if (mode === "crypto") core = core.slice("crypto".length);
   core = core.slice(0, -"bot".length);
@@ -77,24 +45,10 @@ export function botDisplayName(username: string): string {
   return capitalizeFirst(username);
 }
 
-// How many times we re-ask Groq when a call FAILS OUTRIGHT (throws or returns
-// nothing usable). Partial batches are accepted — the pool in getBotUsernames()
-// tops up with further calls, each rotating to a fresh start letter, so chasing
-// an exact count here (the old behavior) just burned up to 4 requests per
-// refill on duplicate-heavy same-letter batches.
-const MAX_ROUNDS = 4;
+const MAX_ROUNDS = 2;
 
-// Process-wide rate-limit cooldown. Groq's free tier is ~200 req/day; once it
-// returns 429 EVERY further request 429s too, so a bot job firing every ~30s
-// across dozens of accounts turns one limit into hundreds of doomed requests
-// (the "still 250 requests" symptom). When we see a 429 we park all network
-// refills until this timestamp — pooled names still serve for free meanwhile.
 let cooldownUntil = 0;
 
-// Groq tells us how long to wait via the Retry-After header (seconds) or, for
-// daily-quota 429s, only in the error message ("try again in 2m59.5s"). Parse
-// both so the cooldown matches reality instead of re-probing every minute and
-// re-burning the quota. Falls back to 5 min when nothing parseable is found.
 function parseRetryAfterMs(header: string | null, body: string): number {
   const ra = Number(header);
   if (Number.isFinite(ra) && ra > 0) return ra * 1000;
@@ -106,10 +60,6 @@ function parseRetryAfterMs(header: string | null, body: string): number {
   return 5 * 60_000;
 }
 
-// Build the user prompt for one Groq request. `letter` is the forced first-word
-// initial for this call (rotating sweep) — it steers the batch off the model's
-// default favorites without any example words or rejected-name lists, keeping the
-// prompt short.
 function buildUserPrompt(
   want: number,
   mode: GenMode,
@@ -152,8 +102,6 @@ function buildUserPrompt(
     .join("\n");
 }
 
-// Read the assistant text from a Groq SSE response. The API streams JSON events
-// as `data:` lines; only assistant content is relevant to username generation.
 async function readGroqStream(res: Response): Promise<string> {
   if (!res.body) return "";
 
@@ -187,14 +135,10 @@ async function readGroqStream(res: Response): Promise<string> {
 }
 
 function parseJsonContent(content: string): any {
-  // JSON mode should return a bare object, but stripping a fence makes this
-  // resilient to a model/provider regression without weakening validation below.
   const normalized = content.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   return JSON.parse(normalized || "{}");
 }
 
-// One Groq request. Returns clean, rule-compliant handles not in `avoid`.
-// Throws on any network/API/parse error so the caller can retry — no fallback.
 async function callGroqOnce(
   key: string,
   want: number,
@@ -208,7 +152,6 @@ async function callGroqOnce(
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${key}`,
-      // Use the current Compound tool set, including visit_website.
       "Groq-Model-Version": "latest",
     },
     body: JSON.stringify({
@@ -243,13 +186,10 @@ async function callGroqOnce(
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     const suffix = detail ? `: ${detail.slice(0, 300)}` : "";
-    // A 429/400/413 won't be fixed by resending the identical request, so mark
-    // it non-retryable — the round loop stops instead of burning 3 more. On 429
-    // open the process-wide cooldown so sibling bot jobs skip Groq entirely.
     if (res.status === 429) {
       cooldownUntil = Date.now() + parseRetryAfterMs(res.headers.get("retry-after"), detail);
     }
-    const retryable = res.status >= 500; // only server errors are worth a retry
+    const retryable = res.status >= 500;
     throw Object.assign(new Error(`Groq HTTP ${res.status}${suffix}`), { retryable });
   }
 
@@ -277,52 +217,32 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
   const { count, theme, avoid = [], mode = "default" } = opts;
   const key = process.env.GROQ_API_KEY;
 
-  // AI-only: with no key there is nothing to generate. Throw so the route logs
-  // the actual configuration problem instead of reporting an opaque empty batch.
   if (!key) throw new Error("GROQ_API_KEY is not configured.");
 
-  // `seen` starts with the caller's avoid list (handles already rejected by
-  // BotFather this run) and grows every round, so each retry asks Groq for
-  // words it hasn't given us yet.
   const seen = new Set(avoid);
-  const out: string[] = [];
   let lastError: unknown;
 
-  // One successful call is enough — partial batches are fine. Retries only on
-  // outright failure (throw / empty), NOT to top up to `count`: each retry burns
-  // a quota'd request and same-letter batches under-deliver anyway, so topping
-  // up here multiplied requests without meaningfully more names.
-  for (let round = 0; round < MAX_ROUNDS && out.length === 0; round++) {
-    const want = count;
+  for (let round = 0; round < MAX_ROUNDS; round++) {
     try {
-      const batch = await callGroqOnce(key, want, [...seen], mode, theme);
+      const batch = await callGroqOnce(key, count, [...seen], mode, theme);
+      const out: string[] = [];
       for (const handle of batch) {
         if (!seen.has(handle)) {
           seen.add(handle);
           out.push(handle);
         }
       }
+      return out;
     } catch (err) {
       lastError = err;
-      // 4xx (rate limit / bad request / too large): retrying the identical
-      // request just spends more quota, so stop the round loop now.
       if ((err as { retryable?: boolean })?.retryable === false) break;
-      // Transient network/API error — try another round.
     }
   }
 
-  if (out.length === 0 && lastError) throw lastError;
-  return out;
+  if (lastError) throw lastError;
+  return [];
 }
 
-// Cross-job candidate pool + known-taken set, both process-lifetime and in-memory
-// (no DB — free Render tier). One Groq call yields BATCH names but a single
-// bot only consumes a few, so the leftovers are parked in `pool` for the next
-// bot/job instead of burning another request. `tried` remembers every handle
-// already sent to BotFather this process so no later job re-attempts a name we
-// know is taken — the exact repetition seen in the logs.
-// 60 names ≈ ~400 output tokens, far under max_completion_tokens — one call now
-// feeds ~10 bots instead of ~2.5, cutting Groq calls ~4x (200/day free-tier quota).
 const BATCH = 60;
 const pool: Record<string, string[]> = {};
 const tried = new Set<string>();
@@ -331,17 +251,21 @@ function poolKey(mode: GenMode, theme?: string): string {
   return mode === "custom" ? `custom:${theme ?? ""}` : mode;
 }
 
-// Record handles BotFather has already seen (taken/invalid/used) so they're never
-// handed out again this process.
 export function markTried(handles: string[]): void {
   for (const h of handles) tried.add(h);
-  // ponytail: crude cap; one run rarely nears this. Persist to Supabase only if
-  // cross-restart memory is ever needed.
   if (tried.size > 5000) tried.clear();
 }
 
-// Draw `count` usable handles, refilling the shared pool BATCH-at-a-time. Draws
-// cost no API call until the pool runs dry.
+function drainPool(buf: string[], skip: Set<string>, out: string[], count: number): void {
+  while (buf.length && out.length < count) {
+    const h = buf.shift()!;
+    if (!skip.has(h)) {
+      skip.add(h);
+      out.push(h);
+    }
+  }
+}
+
 export async function getBotUsernames(
   count: number,
   opts: { mode?: GenMode; theme?: string; avoid?: string[] }
@@ -355,34 +279,30 @@ export async function getBotUsernames(
     `[groq] draw ${count} from pool "${poolKey(mode, theme)}" — ${buf.length} pooled, ${tried.size} tried`
   );
 
-  while (out.length < count) {
-    while (buf.length && out.length < count) {
-      const h = buf.shift()!;
+  drainPool(buf, skip, out, count);
+  if (out.length >= count) return out;
+
+  if (Date.now() < cooldownUntil) {
+    console.log(
+      `[groq] cooling down ${Math.round((cooldownUntil - Date.now()) / 1000)}s — skipping request (${out.length}/${count} from pool)`
+    );
+    return out;
+  }
+
+  console.log(`[groq] pool "${poolKey(mode, theme)}" dry — requesting ${BATCH} fresh names`);
+  try {
+    const fresh = await generateBotUsernames({ count: BATCH, mode, theme, avoid: [...skip] });
+    for (const h of fresh) {
       if (!skip.has(h)) {
         skip.add(h);
-        out.push(h);
+        buf.push(h);
       }
     }
-    if (out.length >= count) break;
-
-    // Rate-limited recently — don't spend a request that will just 429 again.
-    // Return whatever the pool gave (maybe nothing); the caller backs this bot
-    // off instead of hammering Groq, which is what ran the quota to zero.
-    if (Date.now() < cooldownUntil) {
-      console.log(
-        `[groq] cooling down ${Math.round((cooldownUntil - Date.now()) / 1000)}s — skipping request (${out.length}/${count} from pool)`
-      );
-      break;
-    }
-
-    // Visible proof of quota spend: this line should appear ~once per 10 bots,
-    // not once per account. Absent = served from the pooled batch.
-    console.log(`[groq] pool "${poolKey(mode, theme)}" dry — requesting ${BATCH} fresh names`);
-    const fresh = await generateBotUsernames({ count: BATCH, mode, theme, avoid: [...skip] });
-    const usable = fresh.filter((h) => !skip.has(h));
-    if (!usable.length) break; // API down/empty or nothing new — return what we have
-    buf.push(...usable);
-    if (buf.length > BATCH * 2) buf.length = BATCH * 2; // ponytail: cap parked names
+  } catch (err) {
+    console.log(`[groq] refill failed: ${(err as Error)?.message ?? err}`);
   }
+
+  drainPool(buf, skip, out, count);
+  if (buf.length > BATCH * 2) buf.length = BATCH * 2;
   return out;
 }
