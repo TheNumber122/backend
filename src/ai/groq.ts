@@ -12,7 +12,7 @@
 // tool-calling loop.
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "groq/compound";
+const GROQ_MODEL = "groq/compound-mini";
 
 type GenMode = "default" | "crypto" | "custom";
 
@@ -83,6 +83,28 @@ export function botDisplayName(username: string): string {
 // an exact count here (the old behavior) just burned up to 4 requests per
 // refill on duplicate-heavy same-letter batches.
 const MAX_ROUNDS = 4;
+
+// Process-wide rate-limit cooldown. Groq's free tier is ~200 req/day; once it
+// returns 429 EVERY further request 429s too, so a bot job firing every ~30s
+// across dozens of accounts turns one limit into hundreds of doomed requests
+// (the "still 250 requests" symptom). When we see a 429 we park all network
+// refills until this timestamp — pooled names still serve for free meanwhile.
+let cooldownUntil = 0;
+
+// Groq tells us how long to wait via the Retry-After header (seconds) or, for
+// daily-quota 429s, only in the error message ("try again in 2m59.5s"). Parse
+// both so the cooldown matches reality instead of re-probing every minute and
+// re-burning the quota. Falls back to 5 min when nothing parseable is found.
+function parseRetryAfterMs(header: string | null, body: string): number {
+  const ra = Number(header);
+  if (Number.isFinite(ra) && ra > 0) return ra * 1000;
+  const m = body.match(/try again in\s+(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?/i);
+  if (m && (m[1] || m[2] || m[3])) {
+    const ms = ((Number(m[1] || 0) * 60 + Number(m[2] || 0)) * 60 + Number(m[3] || 0)) * 1000;
+    if (ms > 0) return ms;
+  }
+  return 5 * 60_000;
+}
 
 // Build the user prompt for one Groq request. `letter` is the forced first-word
 // initial for this call (rotating sweep) — it steers the batch off the model's
@@ -221,7 +243,14 @@ async function callGroqOnce(
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     const suffix = detail ? `: ${detail.slice(0, 300)}` : "";
-    throw new Error(`Groq HTTP ${res.status}${suffix}`);
+    // A 429/400/413 won't be fixed by resending the identical request, so mark
+    // it non-retryable — the round loop stops instead of burning 3 more. On 429
+    // open the process-wide cooldown so sibling bot jobs skip Groq entirely.
+    if (res.status === 429) {
+      cooldownUntil = Date.now() + parseRetryAfterMs(res.headers.get("retry-after"), detail);
+    }
+    const retryable = res.status >= 500; // only server errors are worth a retry
+    throw Object.assign(new Error(`Groq HTTP ${res.status}${suffix}`), { retryable });
   }
 
   const content = await readGroqStream(res);
@@ -275,6 +304,9 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
       }
     } catch (err) {
       lastError = err;
+      // 4xx (rate limit / bad request / too large): retrying the identical
+      // request just spends more quota, so stop the round loop now.
+      if ((err as { retryable?: boolean })?.retryable === false) break;
       // Transient network/API error — try another round.
     }
   }
@@ -332,6 +364,16 @@ export async function getBotUsernames(
       }
     }
     if (out.length >= count) break;
+
+    // Rate-limited recently — don't spend a request that will just 429 again.
+    // Return whatever the pool gave (maybe nothing); the caller backs this bot
+    // off instead of hammering Groq, which is what ran the quota to zero.
+    if (Date.now() < cooldownUntil) {
+      console.log(
+        `[groq] cooling down ${Math.round((cooldownUntil - Date.now()) / 1000)}s — skipping request (${out.length}/${count} from pool)`
+      );
+      break;
+    }
 
     // Visible proof of quota spend: this line should appear ~once per 10 bots,
     // not once per account. Absent = served from the pooled batch.
