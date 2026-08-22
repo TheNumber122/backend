@@ -23,10 +23,6 @@ interface GenerateOpts {
   mode?: GenMode; // 'crypto' forces start-with-"crypto", end-with bot/robot
 }
 
-// How many extra candidates to request beyond `count`, so a few "username taken"
-// collisions are covered by a single AI call instead of many.
-const BUFFER = 5;
-
 // NOTE: `avoid` is used ONLY to de-dupe the OUTPUT (the `skip` Set in
 // callGroqOnce) — it is deliberately NOT pasted into the prompt. The rotating
 // letter constraint (see nextLetter) spreads batches apart without spending
@@ -81,8 +77,11 @@ export function botDisplayName(username: string): string {
   return capitalizeFirst(username);
 }
 
-// How many times we re-ask Groq within one generateBotUsernames() call when a
-// batch comes back too small (duplicates/junk) or a transient API error hits.
+// How many times we re-ask Groq when a call FAILS OUTRIGHT (throws or returns
+// nothing usable). Partial batches are accepted — the pool in getBotUsernames()
+// tops up with further calls, each rotating to a fresh start letter, so chasing
+// an exact count here (the old behavior) just burned up to 4 requests per
+// refill on duplicate-heavy same-letter batches.
 const MAX_ROUNDS = 4;
 
 // Build the user prompt for one Groq request. `letter` is the forced first-word
@@ -260,8 +259,12 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
   const out: string[] = [];
   let lastError: unknown;
 
-  for (let round = 0; round < MAX_ROUNDS && out.length < count; round++) {
-    const want = count - out.length + BUFFER;
+  // One successful call is enough — partial batches are fine. Retries only on
+  // outright failure (throw / empty), NOT to top up to `count`: each retry burns
+  // a quota'd request and same-letter batches under-deliver anyway, so topping
+  // up here multiplied requests without meaningfully more names.
+  for (let round = 0; round < MAX_ROUNDS && out.length === 0; round++) {
+    const want = count;
     try {
       const batch = await callGroqOnce(key, want, [...seen], mode, theme);
       for (const handle of batch) {
@@ -286,7 +289,9 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
 // bot/job instead of burning another request. `tried` remembers every handle
 // already sent to BotFather this process so no later job re-attempts a name we
 // know is taken — the exact repetition seen in the logs.
-const BATCH = 15;
+// 60 names ≈ ~400 output tokens, far under max_completion_tokens — one call now
+// feeds ~10 bots instead of ~2.5, cutting Groq calls ~4x (200/day free-tier quota).
+const BATCH = 60;
 const pool: Record<string, string[]> = {};
 const tried = new Set<string>();
 
@@ -314,6 +319,10 @@ export async function getBotUsernames(
   const skip = new Set([...avoid, ...tried]);
   const out: string[] = [];
 
+  console.log(
+    `[groq] draw ${count} from pool "${poolKey(mode, theme)}" — ${buf.length} pooled, ${tried.size} tried`
+  );
+
   while (out.length < count) {
     while (buf.length && out.length < count) {
       const h = buf.shift()!;
@@ -324,6 +333,9 @@ export async function getBotUsernames(
     }
     if (out.length >= count) break;
 
+    // Visible proof of quota spend: this line should appear ~once per 10 bots,
+    // not once per account. Absent = served from the pooled batch.
+    console.log(`[groq] pool "${poolKey(mode, theme)}" dry — requesting ${BATCH} fresh names`);
     const fresh = await generateBotUsernames({ count: BATCH, mode, theme, avoid: [...skip] });
     const usable = fresh.filter((h) => !skip.has(h));
     if (!usable.length) break; // API down/empty or nothing new — return what we have
