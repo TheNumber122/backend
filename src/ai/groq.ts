@@ -194,7 +194,17 @@ async function callGroqOnce(
   }
 
   const content = await readGroqStream(res);
-  const parsed = parseJsonContent(content);
+
+  let parsed: any;
+  try {
+    parsed = parseJsonContent(content);
+  } catch (e) {
+    console.log(
+      `[groq] parse failed (${(e as Error)?.message}) — raw ${content.length}c: ${JSON.stringify(content.slice(0, 400))}`
+    );
+    throw e;
+  }
+
   const list: unknown[] = Array.isArray(parsed?.usernames)
     ? parsed.usernames
     : Array.isArray(parsed)
@@ -203,13 +213,24 @@ async function callGroqOnce(
 
   const skip = new Set(avoid);
   const cleaned: string[] = [];
+  let sanitizedCount = 0;
   for (const item of list) {
     const handle = sanitize(item, mode);
-    if (handle && !skip.has(handle)) {
+    if (!handle) continue;
+    sanitizedCount++;
+    if (!skip.has(handle)) {
       skip.add(handle);
       cleaned.push(handle);
     }
   }
+
+  console.log(
+    `[groq] result letter=${letter} parsed=${list.length} sanitized=${sanitizedCount} new=${cleaned.length}` +
+      (cleaned.length === 0
+        ? ` | raw ${content.length}c: ${JSON.stringify(content.slice(0, 400))}`
+        : ` | ${cleaned.slice(0, 8).join(", ")}`)
+  );
+
   return cleaned;
 }
 
