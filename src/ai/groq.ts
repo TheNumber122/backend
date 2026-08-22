@@ -8,6 +8,7 @@ interface GenerateOpts {
   theme?: string;
   avoid?: string[];
   mode?: GenMode;
+  log?: (message: string) => void;
 }
 
 const MAX_WORD_LEN = 8;
@@ -144,7 +145,8 @@ async function callGroqOnce(
   want: number,
   avoid: string[],
   mode: GenMode,
-  theme?: string
+  theme: string | undefined,
+  emit: (message: string) => void
 ): Promise<string[]> {
   const letter = nextLetter();
   const res = await fetch(GROQ_URL, {
@@ -199,7 +201,7 @@ async function callGroqOnce(
   try {
     parsed = parseJsonContent(content);
   } catch (e) {
-    console.log(
+    emit(
       `[groq] parse failed (${(e as Error)?.message}) — raw ${content.length}c: ${JSON.stringify(content.slice(0, 400))}`
     );
     throw e;
@@ -224,7 +226,7 @@ async function callGroqOnce(
     }
   }
 
-  console.log(
+  emit(
     `[groq] result letter=${letter} parsed=${list.length} sanitized=${sanitizedCount} new=${cleaned.length}` +
       (cleaned.length === 0
         ? ` | raw ${content.length}c: ${JSON.stringify(content.slice(0, 400))}`
@@ -235,7 +237,8 @@ async function callGroqOnce(
 }
 
 export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]> {
-  const { count, theme, avoid = [], mode = "default" } = opts;
+  const { count, theme, avoid = [], mode = "default", log } = opts;
+  const emit = log ?? ((m: string) => console.log(m));
   const key = process.env.GROQ_API_KEY;
 
   if (!key) throw new Error("GROQ_API_KEY is not configured.");
@@ -245,7 +248,7 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
     try {
-      const batch = await callGroqOnce(key, count, [...seen], mode, theme);
+      const batch = await callGroqOnce(key, count, [...seen], mode, theme, emit);
       const out: string[] = [];
       for (const handle of batch) {
         if (!seen.has(handle)) {
@@ -289,14 +292,15 @@ function drainPool(buf: string[], skip: Set<string>, out: string[], count: numbe
 
 export async function getBotUsernames(
   count: number,
-  opts: { mode?: GenMode; theme?: string; avoid?: string[] }
+  opts: { mode?: GenMode; theme?: string; avoid?: string[]; log?: (message: string) => void }
 ): Promise<string[]> {
-  const { mode = "default", theme, avoid = [] } = opts;
+  const { mode = "default", theme, avoid = [], log } = opts;
+  const emit = log ?? ((m: string) => console.log(m));
   const buf = (pool[poolKey(mode, theme)] ??= []);
   const skip = new Set([...avoid, ...tried]);
   const out: string[] = [];
 
-  console.log(
+  emit(
     `[groq] draw ${count} from pool "${poolKey(mode, theme)}" — ${buf.length} pooled, ${tried.size} tried`
   );
 
@@ -304,15 +308,15 @@ export async function getBotUsernames(
   if (out.length >= count) return out;
 
   if (Date.now() < cooldownUntil) {
-    console.log(
+    emit(
       `[groq] cooling down ${Math.round((cooldownUntil - Date.now()) / 1000)}s — skipping request (${out.length}/${count} from pool)`
     );
     return out;
   }
 
-  console.log(`[groq] pool "${poolKey(mode, theme)}" dry — requesting ${BATCH} fresh names`);
+  emit(`[groq] pool "${poolKey(mode, theme)}" dry — requesting ${BATCH} fresh names`);
   try {
-    const fresh = await generateBotUsernames({ count: BATCH, mode, theme, avoid: [...skip] });
+    const fresh = await generateBotUsernames({ count: BATCH, mode, theme, avoid: [...skip], log: emit });
     for (const h of fresh) {
       if (!skip.has(h)) {
         skip.add(h);
@@ -320,7 +324,7 @@ export async function getBotUsernames(
       }
     }
   } catch (err) {
-    console.log(`[groq] refill failed: ${(err as Error)?.message ?? err}`);
+    emit(`[groq] refill failed: ${(err as Error)?.message ?? err}`);
   }
 
   drainPool(buf, skip, out, count);

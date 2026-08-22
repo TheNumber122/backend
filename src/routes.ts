@@ -1932,6 +1932,7 @@ async function createSingleBotInner(
         theme: usernameTheme,
         mode,
         avoid: rejected, // handles BotFather already refused this run
+        log,
       });
       if (candidates.length === 0) {
         log(`No usernames generated for ${phone} (check GROQ_API_KEY / Groq status).`, "error");
