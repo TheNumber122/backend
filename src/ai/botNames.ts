@@ -3,12 +3,14 @@ import { generateBotUsernames, GenMode } from "./groq";
 
 // Persistent bot-name reservoir backed by the `bot_name_pool` table.
 // Draws claim `free` rows via an atomic lease (claim_bot_names). Groq is called
-// only to refill when the free count drops below LOW_WATER, in one tool-less
-// batch of BUFFER names. Every DB call degrades to direct generation on failure,
-// so the pipeline never crashes and works even before the migration is applied.
+// only when the pool is fully drained, in one tool-less batch of BUFFER names.
+// Every DB call degrades to direct generation on failure, so the pipeline never
+// crashes and works even before the migration is applied.
 
-const LOW_WATER = 60;
-const BUFFER = 200;
+// ponytail: refill only when the pool can't fill this request, so a drained pool
+// makes the requesting job pay the Groq latency (and get a short draw if Groq is
+// in 429 cooldown). Add a background top-up if that stall ever matters.
+const BUFFER = 300;
 
 type Emit = (message: string) => void;
 const emitOf = (log?: Emit): Emit => log ?? ((m) => console.log(m));
@@ -46,8 +48,8 @@ export async function getBotUsernames(
     if (cErr) throw cErr;
     const free = Number(freeData) || 0;
 
-    if (free < LOW_WATER) {
-      emit(`[pool] mode=${mode} free=${free}<${LOW_WATER} — refilling ${BUFFER}`);
+    if (free < count) {
+      emit(`[pool] mode=${mode} free=${free}<${count} — refilling ${BUFFER}`);
       const fresh = await generateBotUsernames({ count: BUFFER, mode, theme, log: emit });
       if (fresh.length) {
         const rows = fresh.map((username) => ({ username, mode, theme: p_theme, status: "free" }));

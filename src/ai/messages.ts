@@ -4,7 +4,9 @@
 // send message texts. Mirrors the request pattern in ./groq.ts.
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "llama-3.3-70b-versatile";
+// llama-3.3-70b-versatile 404s on this key (verified against /v1/models) — every
+// call here was failing. Same model ./groq.ts uses.
+const GROQ_MODEL = "openai/gpt-oss-20b";
 
 // Messages are generated in batches: one Groq call reliably returns ~25 good
 // messages, so for large pools (up to 200) we loop, accumulating until we reach
@@ -62,6 +64,11 @@ async function callGroqOnce(
     body: JSON.stringify({
       model: GROQ_MODEL,
       temperature: 1.0,
+      // Required: this key allows 8000 tokens/min and Groq reserves the output
+      // ceiling upfront, so an uncapped request is rejected 413 before it runs.
+      // ~3000 covers BATCH=25 messages at a few hundred chars each.
+      max_completion_tokens: 3000,
+      reasoning_effort: "low",
       response_format: { type: "json_object" },
       messages: [
         {

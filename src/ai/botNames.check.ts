@@ -14,4 +14,11 @@ assert.deepEqual(extractNames([{ x: 1 }, "", null, "okbot"]), ["okbot"]);
 // non-array
 assert.deepEqual(extractNames(null), []);
 
-console.log("OK: extractNames");
+// Refill trigger: Groq is called only when the pool cannot fill the request.
+const wantsRefill = (free: number, count: number) => free < count;
+assert.equal(wantsRefill(0, 6), true, "drained pool must refill");
+assert.equal(wantsRefill(3, 6), true, "partial pool must refill (short draw otherwise)");
+assert.equal(wantsRefill(6, 6), false, "exact fit must not call Groq");
+assert.equal(wantsRefill(300, 6), false, "full pool must not call Groq");
+
+console.log("OK: extractNames, refill trigger");

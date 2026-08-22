@@ -1,6 +1,23 @@
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "groq/compound-mini";
-const REFILL_TOOLS: string[] = [];
+// NOT a compound/agentic model: those spend the whole completion on delta.reasoning
+// attempting a tool loop and emit no delta.content, so a 200 OK parsed to 0 names.
+// Verified against /v1/models — this key has no llama-* access at all.
+const GROQ_MODEL = "openai/gpt-oss-20b";
+
+// This key's limit is 8000 tokens/min and Groq reserves max_completion_tokens
+// UPFRONT, so a big ceiling throttles us to one call per minute. 1200 fits ~40
+// names with room for the JSON envelope and still allows ~6 calls/min.
+const MAX_OUT_TOKENS = 1200;
+// Asking for 300 in one call returns HTTP 400 json_validate_failed — the model
+// can't hold that many unique invented words coherently. One call also repeats
+// itself heavily within a single start letter (measured: 139 returned, 21 unique),
+// so large requests are filled by looping letters via nextLetter().
+const BATCH = 40;
+const MAX_DRY_ROUNDS = 3;
+// 8000 TPM / MAX_OUT_TOKENS reserved per call ≈ 6 calls/min. Pace ourselves rather
+// than earn a 429 that cools down the whole generator mid-fill.
+const CALL_SPACING_MS = Math.ceil(60_000 / Math.floor(8000 / MAX_OUT_TOKENS));
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export type GenMode = "default" | "crypto" | "custom";
 
@@ -47,8 +64,6 @@ export function botDisplayName(username: string): string {
   return capitalizeFirst(username);
 }
 
-const MAX_ROUNDS = 2;
-
 let cooldownUntil = 0;
 
 function parseRetryAfterMs(header: string | null, body: string): number {
@@ -88,6 +103,10 @@ function buildUserPrompt(
     shapeRule,
     `- the word part (excluding "crypto"/"bot") must be ${MIN_WORD_LEN}-${MAX_WORD_LEN} letters total; if it won't fit, shorten it — keep it pronounceable, never glue on stray consonants`,
     wordKindRule,
+    // Without these the model collapses onto one skeleton and repeats: a single
+    // 150-name call measured 139 returned but only 21 distinct.
+    "- vary the vowel pattern and syllable shape across the list; never reuse the same skeleton with one letter swapped",
+    "- every entry must be distinct from all the others",
     "- lowercase a-z only; no numbers, underscores, spaces or symbols",
   ];
 
@@ -98,7 +117,7 @@ function buildUserPrompt(
     "Rules:",
     ...rules,
     themeLine,
-    'JSON only: {"usernames": ["...", "..."]}',
+    "Output ONE username per line. No numbering, no JSON, no commentary.",
   ]
     .filter(Boolean)
     .join("\n");
@@ -149,9 +168,15 @@ async function readGroqStream(res: Response): Promise<{ content: string; raw: st
   return { content, raw, error: streamError };
 }
 
-function parseJsonContent(content: string): any {
-  const normalized = content.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-  return JSON.parse(normalized || "{}");
+// Newline-delimited, not JSON: with response_format json_object, hitting the token
+// ceiling mid-array made Groq reject the ENTIRE call (stream error 400
+// json_validate_failed) and we got nothing. Line-per-name degrades gracefully —
+// a truncated final line is one dropped name, and sanitize() rejects stray prose.
+function parseLines(content: string): string[] {
+  return content
+    .split(/[\r\n,]+/)
+    .map((l) => l.trim().replace(/^[-*\d.)\s]+/, "").replace(/^@/, ""))
+    .filter(Boolean);
 }
 
 async function callGroqOnce(
@@ -173,16 +198,13 @@ async function callGroqOnce(
     body: JSON.stringify({
       model: GROQ_MODEL,
       temperature: 1,
-      max_completion_tokens: 4096,
+      max_completion_tokens: MAX_OUT_TOKENS,
       top_p: 1,
+      // gpt-oss streams chain-of-thought into delta.reasoning, which we discard —
+      // keep it minimal so the token budget goes to actual names.
+      reasoning_effort: "low",
       stream: true,
       stop: null,
-      response_format: { type: "json_object" },
-      compound_custom: {
-        tools: {
-          enabled_tools: REFILL_TOOLS,
-        },
-      },
       messages: [
         {
           role: "system",
@@ -225,19 +247,15 @@ async function callGroqOnce(
     );
   }
 
-  let parsed: any;
-  try {
-    parsed = parseJsonContent(content);
-  } catch (e) {
-    emit(`[groq] parse failed (${(e as Error)?.message}) — ${diag}`);
-    throw e;
+  // Empty content is a failed call, not an empty result — surface it (and let the
+  // round loop retry) instead of parsing "{}" into a silent 0 names.
+  if (!content.trim()) {
+    emit(`[groq] no content in stream — ${diag}`);
+    throw new Error("Groq returned no content");
   }
 
-  const list: unknown[] = Array.isArray(parsed?.usernames)
-    ? parsed.usernames
-    : Array.isArray(parsed)
-    ? parsed
-    : [];
+  const list: unknown[] = parseLines(content);
+
 
   const skip = new Set(avoid);
   const cleaned: string[] = [];
@@ -273,26 +291,43 @@ export async function generateBotUsernames(opts: GenerateOpts): Promise<string[]
   }
 
   const seen = new Set(avoid);
+  const out: string[] = [];
+  let dry = 0;
+  let calls = 0;
   let lastError: unknown;
 
-  for (let round = 0; round < MAX_ROUNDS; round++) {
+  // One call cannot fill a large request (400s past ~150, and repeats itself
+  // within a start letter), so loop BATCH at a time — nextLetter() advances the
+  // start letter each call, which is what actually produces distinct names.
+  while (out.length < count && dry < MAX_DRY_ROUNDS) {
+    const want = Math.min(BATCH, count - out.length);
+    if (calls > 0) await sleep(CALL_SPACING_MS);
+    calls++;
+    let batch: string[];
     try {
-      const batch = await callGroqOnce(key, count, [...seen], mode, theme, emit);
-      const out: string[] = [];
-      for (const handle of batch) {
-        if (!seen.has(handle)) {
-          seen.add(handle);
-          out.push(handle);
-        }
-      }
-      return out;
+      batch = await callGroqOnce(key, want, [...seen], mode, theme, emit);
     } catch (err) {
       lastError = err;
-      if ((err as { retryable?: boolean })?.retryable === false) break;
+      // A 429 sets cooldownUntil; anything already collected is still worth keeping.
+      if (Date.now() < cooldownUntil) break;
+      dry++;
+      continue;
     }
+
+    const before = out.length;
+    for (const handle of batch) {
+      if (out.length >= count) break;
+      if (!seen.has(handle)) {
+        seen.add(handle);
+        out.push(handle);
+      }
+    }
+    dry = out.length > before ? 0 : dry + 1;
   }
 
-  if (lastError) throw lastError;
-  return [];
+  // Only a total failure is an error — a short draw still beats none.
+  if (!out.length && lastError) throw lastError;
+  emit(`[groq] generated ${out.length}/${count} unique (mode=${mode})`);
+  return out;
 }
 
