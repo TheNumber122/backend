@@ -14,7 +14,8 @@ import {
 import { supabase, protectedDb } from "./db/supabase";
 import { broadcastLog } from "./broadcast";
 import { getWorkspace } from "./workspace";
-import { getBotUsernames, markTried, botDisplayName } from "./ai/groq";
+import { getBotUsernames, markTried } from "./ai/botNames";
+import { botDisplayName } from "./ai/groq";
 import { createBotViaBotFather, deleteBotViaBotFather, listBotsViaBotFather, transferBotViaBotFather } from "./telegram/botfather";
 import { listChatsForAccount, TargetKind } from "./telegram/dialogs";
 import { sendToChat, SendContent } from "./telegram/send";
@@ -1953,7 +1954,7 @@ async function createSingleBotInner(
       );
       // Every handle BotFather saw (taken/invalid or the winner) is now used —
       // stop any later job from re-attempting it.
-      markTried(result.tried);
+      await markTried(result.tried, { mode, theme: usernameTheme });
 
       if (result.ok) {
         // Best-effort save of the token/handle. Even if this fails, the bot DOES

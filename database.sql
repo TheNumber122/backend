@@ -662,3 +662,83 @@ ON messaging_targets
 FOR ALL
 USING (true)
 WITH CHECK (true);
+
+-- ===========================================================================
+-- Persistent bot-name pool. Replaces the old in-memory candidate pool + tried
+-- set (backend/src/ai/groq.ts) so names survive restarts: never regenerate a
+-- handle we've already used/seen, and never re-attempt a taken one. Groq is
+-- called only to refill this table when it runs low (see backend/src/ai/botNames.ts).
+--   status: 'free' (drawable) | 'reserved' (leased to an in-flight job, auto-
+--   returns to free once reserved_until passes) | 'dead' (taken/invalid/used —
+--   never draw or regenerate again). username is the GLOBAL key: availability on
+--   Telegram is global, so a handle is dead regardless of mode.
+-- ===========================================================================
+create table if not exists bot_name_pool (
+  username text primary key,
+  mode text not null default 'default',   -- 'default' | 'crypto' | 'custom'
+  theme text,                             -- custom theme; null for default/crypto
+  status text not null default 'free',    -- 'free' | 'reserved' | 'dead'
+  reserved_until timestamptz,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_bot_name_pool_claim
+  on bot_name_pool (mode, theme, status, created_at);
+
+alter table bot_name_pool enable row level security;
+grant all privileges on table bot_name_pool to service_role;
+
+CREATE POLICY "Allow full access to bot_name_pool"
+ON bot_name_pool
+FOR ALL
+USING (true)
+WITH CHECK (true);
+
+-- Seed: every existing bot handle is 'dead' so it is never regenerated. Safe to
+-- re-run (on conflict do nothing).
+insert into bot_name_pool (username, mode, theme, status)
+select username, pattern, theme, 'dead' from telegram_bots
+on conflict (username) do nothing;
+
+-- Atomically lease up to p_count drawable names (free, or reserved-and-expired)
+-- for a mode/theme. FOR UPDATE SKIP LOCKED guarantees two concurrent jobs can
+-- never claim the same row — this is the no-repeat guarantee. The 2-minute lease
+-- returns unused names to the pool automatically (no cleanup job needed).
+create or replace function claim_bot_names(
+  p_mode text,
+  p_theme text,
+  p_count integer
+)
+returns setof text
+language plpgsql
+as $$
+begin
+  return query
+  update bot_name_pool p
+  set status = 'reserved', reserved_until = now() + interval '2 minutes'
+  where p.username in (
+    select username from bot_name_pool
+    where mode = p_mode
+      and theme is not distinct from p_theme
+      and (status = 'free' or (status = 'reserved' and reserved_until < now()))
+    order by created_at
+    limit p_count
+    for update skip locked
+  )
+  returning p.username;
+end;
+$$;
+
+-- Count of drawable names for a mode/theme; drives the refill decision.
+create or replace function count_free_bot_names(
+  p_mode text,
+  p_theme text
+)
+returns integer
+language sql
+as $$
+  select count(*)::int from bot_name_pool
+  where mode = p_mode
+    and theme is not distinct from p_theme
+    and (status = 'free' or (status = 'reserved' and reserved_until < now()));
+$$;
