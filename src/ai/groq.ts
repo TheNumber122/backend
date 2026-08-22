@@ -103,13 +103,14 @@ function buildUserPrompt(
     .join("\n");
 }
 
-async function readGroqStream(res: Response): Promise<string> {
-  if (!res.body) return "";
+async function readGroqStream(res: Response): Promise<{ content: string; raw: string }> {
+  if (!res.body) return { content: "", raw: "" };
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let pending = "";
   let content = "";
+  let raw = "";
 
   const consumeLine = (line: string) => {
     const trimmed = line.trim();
@@ -117,7 +118,12 @@ async function readGroqStream(res: Response): Promise<string> {
     const payload = trimmed.slice("data:".length).trim();
     if (!payload || payload === "[DONE]") return;
 
-    const event = JSON.parse(payload);
+    let event: any;
+    try {
+      event = JSON.parse(payload);
+    } catch {
+      return;
+    }
     const choice = event?.choices?.[0];
     const chunk = choice?.delta?.content ?? choice?.message?.content;
     if (typeof chunk === "string") content += chunk;
@@ -125,14 +131,16 @@ async function readGroqStream(res: Response): Promise<string> {
 
   while (true) {
     const { value, done } = await reader.read();
-    pending += decoder.decode(value, { stream: !done });
+    const text = decoder.decode(value, { stream: !done });
+    raw += text;
+    pending += text;
     const lines = pending.split(/\r?\n/);
     pending = lines.pop() ?? "";
     for (const line of lines) consumeLine(line);
     if (done) break;
   }
   if (pending) consumeLine(pending);
-  return content;
+  return { content, raw };
 }
 
 function parseJsonContent(content: string): any {
@@ -195,15 +203,14 @@ async function callGroqOnce(
     throw Object.assign(new Error(`Groq HTTP ${res.status}${suffix}`), { retryable });
   }
 
-  const content = await readGroqStream(res);
+  const { content, raw } = await readGroqStream(res);
+  const diag = `HTTP ${res.status} ct=${res.headers.get("content-type") ?? ""} reqid=${res.headers.get("x-request-id") ?? res.headers.get("x-groq-request-id") ?? ""} raw ${raw.length}c: ${JSON.stringify(raw.slice(0, 500))}`;
 
   let parsed: any;
   try {
     parsed = parseJsonContent(content);
   } catch (e) {
-    emit(
-      `[groq] parse failed (${(e as Error)?.message}) — raw ${content.length}c: ${JSON.stringify(content.slice(0, 400))}`
-    );
+    emit(`[groq] parse failed (${(e as Error)?.message}) — ${diag}`);
     throw e;
   }
 
@@ -228,9 +235,7 @@ async function callGroqOnce(
 
   emit(
     `[groq] result letter=${letter} parsed=${list.length} sanitized=${sanitizedCount} new=${cleaned.length}` +
-      (cleaned.length === 0
-        ? ` | raw ${content.length}c: ${JSON.stringify(content.slice(0, 400))}`
-        : ` | ${cleaned.slice(0, 8).join(", ")}`)
+      (cleaned.length === 0 ? ` | ${diag}` : ` | ${cleaned.slice(0, 8).join(", ")}`)
   );
 
   return cleaned;
